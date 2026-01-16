@@ -1609,20 +1609,46 @@ the package updater script, where they can retry the build.
 
         # Push
         if is_internal:
-            # Internal src.suse.de - direct push
-            print_color("\nPushing to src.suse.de...", "blue")
+            # Internal src.suse.de - fork-based workflow
+            # Push feature branch to fork (origin), then create PR to pool (upstream)
+            feature_branch = getattr(self, '_feature_branch', None)
+            tracking_branch = getattr(self, '_tracking_branch', 'main')
+            git_host = getattr(self, '_git_host', 'src.suse.de')
+            package_name = getattr(self, '_package_name', self.instance.package)
+
+            print_color(f"\nPushing feature branch to your fork...", "blue")
             try:
+                # Push feature branch to origin (fork)
                 run_cmd(
-                    ["git", "push"],
+                    ["git", "push", "-u", "origin", feature_branch or "HEAD"],
                     cwd=self.work_dir,
                     timeout=120,
                     capture=False,
                 )
-                print_color("  Pushed successfully", "green")
-                return True
+                print_color("  Pushed to fork successfully", "green")
             except Exception as e:
                 print_color(f"  Push failed: {e}", "red")
                 return False
+
+            # Create PR from fork to pool
+            print_color(f"\nCreating pull request to pool/{package_name}...", "blue")
+
+            # Get username from stored value
+            username = getattr(self, '_git_username', None)
+            if not username:
+                # Fallback: try to parse from stored fork URL
+                fork_url = getattr(self, '_fork_url', '')
+                if fork_url and ':' in fork_url:
+                    # Parse from gitea@src.suse.de:username/package.git
+                    username = fork_url.split(':')[1].split('/')[0]
+
+            # Construct PR URL for Gitea
+            pr_url = f"https://{git_host}/pool/{package_name}/compare/{tracking_branch}...{username}:{feature_branch}"
+            print_color(f"\n  To create the PR, visit:", "blue")
+            print_color(f"  {pr_url}", "cyan")
+            print_color(f"\n  Or use the Gitea web interface:", "blue")
+            print_color(f"  https://{git_host}/{username}/{package_name}/pulls", "cyan")
+            return True
         else:
             # External src.opensuse.org - use agit PR workflow
             branch_name = f"update-{self.target_version}" if self.target_version else "update"
@@ -1852,52 +1878,180 @@ the package updater script, where they can retry the build.
         print_color(f"\nWorkspace: {self.work_dir}", "green")
         return True
 
+    def _get_git_username(self, git_host: str) -> Optional[str]:
+        """Get the username for a git host from git config or prompt."""
+        # Try to get from git config
+        try:
+            result = run_cmd(
+                ["git", "config", "--get", f"credential.https://{git_host}.username"],
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+        # Prompt user
+        username = self._prompt_input(f"  Enter your username for {git_host}", "")
+        return username if username else None
+
+    def _check_fork_exists(self, fork_url: str) -> bool:
+        """Check if a git fork exists by attempting to ls-remote."""
+        try:
+            result = run_cmd(
+                ["git", "ls-remote", fork_url],
+                timeout=30,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def update_srcgit_workflow(self) -> bool:
         """Update package using src-git workflow."""
         print_color("\n=== src-git Workflow ===", "cyan")
         self.is_git_workflow = True
 
-        git_url = self.instance.src_git_url
-        if not git_url:
+        pool_url = self.instance.src_git_url
+        if not pool_url:
             print_color("  No src-git URL detected", "red")
             return False
 
-        print_color(f"\nGit repository: {git_url}", "blue")
-        if self.instance.src_git_branch:
-            print_color(f"Branch: {self.instance.src_git_branch}", "blue")
+        is_internal = SRC_SUSE in pool_url
+        tracking_branch = self.instance.src_git_branch or "main"
 
-        # Determine if internal or external
-        is_internal = SRC_SUSE in git_url
+        print_color(f"\nPool repository: {pool_url}", "blue")
+        print_color(f"Tracking branch: {tracking_branch}", "blue")
 
-        # Step 1: Clone
-        print_color("\nStep 1: Cloning repository...", "blue")
+        # Parse the pool URL to construct fork URL
+        # Pool URL format: https://src.suse.de/pool/himmelblau
+        # Fork SSH URL format: gitea@src.suse.de:<username>/<package>.git
+        # Pool SSH URL format: gitea@src.suse.de:pool/<package>.git
+        parsed = urllib.parse.urlparse(pool_url)
+        git_host = parsed.netloc
+        path_parts = parsed.path.strip("/").split("/")
+
+        if len(path_parts) < 2 or path_parts[0] != "pool":
+            print_color(f"  Unexpected pool URL format: {pool_url}", "red")
+            print_color("  Expected format: https://src.suse.de/pool/<package>", "red")
+            return False
+
+        package_name = path_parts[1]
+
+        # Convert pool URL to SSH format for upstream remote
+        pool_ssh_url = f"gitea@{git_host}:pool/{package_name}.git"
+
+        # Get username for the git host
+        print_color(f"\nStep 1: Setting up fork...", "blue")
+        username = self._get_git_username(git_host)
+        if not username:
+            print_color("  Username required for src-git workflow", "red")
+            return False
+
+        # Use SSH URL format for fork
+        fork_url = f"gitea@{git_host}:{username}/{package_name}.git"
+        print_color(f"  Fork URL: {fork_url}", "blue")
+
+        # Check if fork exists
+        if self._check_fork_exists(fork_url):
+            print_color(f"  Fork exists", "green")
+        else:
+            print_color(f"  Fork does not exist at {fork_url}", "yellow")
+            print_color(f"  Please create a fork of {pool_url} at {fork_url}", "yellow")
+            print_color(f"  You can do this via the web interface at https://{git_host}", "yellow")
+            if not self._confirm("Have you created the fork? Continue?"):
+                return False
+
+        # Step 2: Clone the fork
+        print_color("\nStep 2: Cloning your fork...", "blue")
         if not self._confirm("Proceed with cloning?"):
             return False
 
         self.work_dir = Path(tempfile.mkdtemp(prefix="pkg-update-"))
-        pkg_dir = self.work_dir / self.instance.package
+        pkg_dir = self.work_dir / package_name
 
         try:
             run_cmd(
-                ["git", "clone", git_url, str(pkg_dir)],
+                ["git", "clone", fork_url, str(pkg_dir)],
                 timeout=120,
+                capture=False,
             )
             self.work_dir = pkg_dir
-
-            if self.instance.src_git_branch:
-                run_cmd(
-                    ["git", "checkout", self.instance.src_git_branch],
-                    cwd=self.work_dir,
-                    timeout=30,
-                )
-
             print_color(f"  Cloned to: {self.work_dir}", "green")
         except Exception as e:
             print_color(f"  Clone failed: {e}", "red")
             return False
 
-        # Step 2: Update _service file
-        print_color("\nStep 2: Updating _service file...", "blue")
+        # Step 3: Add pool as upstream and sync
+        print_color("\nStep 3: Syncing with upstream pool...", "blue")
+        try:
+            # Add upstream remote using SSH URL
+            run_cmd(
+                ["git", "remote", "add", "upstream", pool_ssh_url],
+                cwd=self.work_dir,
+                timeout=30,
+                check=False,  # May already exist
+            )
+
+            # Fetch from upstream
+            run_cmd(
+                ["git", "fetch", "upstream"],
+                cwd=self.work_dir,
+                timeout=120,
+                capture=False,
+            )
+
+            # Checkout tracking branch and sync with upstream
+            run_cmd(
+                ["git", "checkout", tracking_branch],
+                cwd=self.work_dir,
+                timeout=30,
+                check=False,
+            )
+
+            # Reset to upstream's tracking branch to ensure we're in sync
+            run_cmd(
+                ["git", "reset", "--hard", f"upstream/{tracking_branch}"],
+                cwd=self.work_dir,
+                timeout=30,
+            )
+
+            print_color(f"  Synced with upstream/{tracking_branch}", "green")
+        except Exception as e:
+            print_color(f"  Sync failed: {e}", "red")
+            if not self._confirm("Continue anyway?"):
+                return False
+
+        # Step 4: Create feature branch
+        print_color("\nStep 4: Creating feature branch...", "blue")
+        branch_suffix = f"update-{self.target_version}" if self.target_version else "update"
+        feature_branch = f"{tracking_branch}-{branch_suffix}"
+        feature_branch = self._prompt_input("  Feature branch name", feature_branch)
+
+        try:
+            run_cmd(
+                ["git", "checkout", "-b", feature_branch],
+                cwd=self.work_dir,
+                timeout=30,
+            )
+            print_color(f"  Created branch: {feature_branch}", "green")
+        except Exception as e:
+            print_color(f"  Failed to create branch: {e}", "red")
+            return False
+
+        # Store for later use in PR creation
+        self._feature_branch = feature_branch
+        self._tracking_branch = tracking_branch
+        self._pool_url = pool_url  # HTTPS URL for web links
+        self._pool_ssh_url = pool_ssh_url  # SSH URL for git operations
+        self._fork_url = fork_url  # SSH URL
+        self._git_host = git_host
+        self._package_name = package_name
+        self._git_username = username
+
+        # Step 5: Update _service file
+        print_color("\nStep 5: Updating _service file...", "blue")
         service_file = self.work_dir / "_service"
         if service_file.exists():
             content = service_file.read_text()
@@ -1935,16 +2089,17 @@ the package updater script, where they can retry the build.
         else:
             print_color("  No _service file found", "yellow")
 
-        # Step 3: Run osc service (if _service file exists)
+        # Step 6: Run osc service (if _service file exists)
         has_service_file = (self.work_dir / "_service").exists()
         if has_service_file:
+            print_color("\nStep 6: Running osc service...", "blue")
             if self._confirm("Run osc service to fetch sources?", default_yes=True):
                 if not self._run_osc_service():
                     if not self._confirm("Service failed. Continue anyway?"):
                         return False
 
-        # Step 4: Verify version matches (always do this)
-        print_color("\nStep 4: Verifying version...", "blue")
+        # Step 7: Verify version matches (always do this)
+        print_color("\nStep 7: Verifying version...", "blue")
         version_ok, detected_version = self._verify_version_after_service()
 
         # Loop to fix version issues
@@ -1977,12 +2132,14 @@ the package updater script, where they can retry the build.
                 # Update target_version to match what we actually got
                 self.target_version = detected_version
 
-        # Step 5: Create changelog
+        # Step 8: Create changelog
+        print_color("\nStep 8: Creating changelog...", "blue")
         changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
         custom_msg = self._prompt_input("  Changelog message", changelog_msg)
         self._create_changelog(custom_msg)
 
-        # Step 6: Test build (optional)
+        # Step 9: Test build (optional)
+        print_color("\nStep 9: Test build...", "blue")
         if self._confirm("Run a test build?", default_yes=True):
             build_success, build_log = self._run_test_build()
             while not build_success:
@@ -1997,7 +2154,8 @@ the package updater script, where they can retry the build.
                     print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
                     return False
 
-        # Step 7: Commit and push/PR
+        # Step 10: Commit and push/PR
+        print_color("\nStep 10: Commit and push...", "blue")
         commit_msg = f"Update to {self.target_version}" if self.target_version else "Update to latest version"
         if is_internal:
             action = "commit and push"
