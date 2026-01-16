@@ -760,6 +760,317 @@ def find_git_tag_for_version(git_url: str, version: str) -> Optional[str]:
         return None
 
 
+class ReleaseNoteFetcher:
+    """Fetch release notes from various upstream sources."""
+
+    def __init__(self, ai_provider: str = "claude"):
+        self.ai_provider = ai_provider
+
+    def _fetch_url(self, url: str, headers: Optional[dict] = None) -> Optional[str]:
+        """Fetch URL content."""
+        try:
+            default_headers = {"User-Agent": "pakdev/1.0"}
+            if headers:
+                default_headers.update(headers)
+            req = urllib.request.Request(url, headers=default_headers)
+            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
+                return response.read().decode()
+        except Exception:
+            return None
+
+    def _extract_github_owner_repo(self, url: str) -> Optional[tuple[str, str]]:
+        """Extract owner and repo from GitHub URL."""
+        patterns = [
+            r"github\.com[/:]([^/]+)/([^/\.]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1), match.group(2).replace(".git", "")
+        return None
+
+    def _extract_gitlab_info(self, url: str) -> Optional[tuple[str, str, str]]:
+        """Extract host, owner, and repo from GitLab URL."""
+        # Handle various GitLab URL formats
+        patterns = [
+            r"(gitlab\.[^/]+)[/:]([^/]+)/([^/\.]+)",
+            r"(git\.[^/]+)[/:]([^/]+)/([^/\.]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1), match.group(2), match.group(3).replace(".git", "")
+        return None
+
+    def fetch_github_release_notes(self, url: str, version: str) -> Optional[str]:
+        """Fetch release notes from GitHub for a specific version."""
+        owner_repo = self._extract_github_owner_repo(url)
+        if not owner_repo:
+            return None
+
+        owner, repo = owner_repo
+
+        # Try to find the release by tag (with and without 'v' prefix)
+        tag_variants = [version, f"v{version}", f"V{version}"]
+
+        for tag in tag_variants:
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+            content = self._fetch_url(api_url)
+
+            if content:
+                try:
+                    release = json.loads(content)
+                    body = release.get("body", "")
+                    if body:
+                        return self._format_release_notes(body, release.get("name", f"Version {version}"))
+                except json.JSONDecodeError:
+                    pass
+
+        # If no specific release, try to get release list and find matching version
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/releases"
+        content = self._fetch_url(api_url)
+
+        if content:
+            try:
+                releases = json.loads(content)
+                for release in releases:
+                    tag = release.get("tag_name", "")
+                    # Normalize and compare versions
+                    tag_version = re.sub(r"^[vV]", "", tag)
+                    if tag_version == version or tag_version == re.sub(r"^[vV]", "", version):
+                        body = release.get("body", "")
+                        if body:
+                            return self._format_release_notes(body, release.get("name", f"Version {version}"))
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def fetch_gitlab_release_notes(self, url: str, version: str) -> Optional[str]:
+        """Fetch release notes from GitLab for a specific version."""
+        gitlab_info = self._extract_gitlab_info(url)
+        if not gitlab_info:
+            return None
+
+        host, owner, repo = gitlab_info
+
+        # URL-encode the project path
+        project_path = urllib.parse.quote(f"{owner}/{repo}", safe="")
+
+        # Try to find the release by tag
+        tag_variants = [version, f"v{version}", f"V{version}"]
+
+        for tag in tag_variants:
+            encoded_tag = urllib.parse.quote(tag, safe="")
+            api_url = f"https://{host}/api/v4/projects/{project_path}/releases/{encoded_tag}"
+            content = self._fetch_url(api_url)
+
+            if content:
+                try:
+                    release = json.loads(content)
+                    description = release.get("description", "")
+                    if description:
+                        return self._format_release_notes(description, release.get("name", f"Version {version}"))
+                except json.JSONDecodeError:
+                    pass
+
+        return None
+
+    def fetch_changelog_from_repo(self, git_url: str, version: str) -> Optional[str]:
+        """Try to fetch CHANGELOG file from repository and extract relevant section."""
+        # Convert URL to raw file URL for common hosts
+        if "github.com" in git_url:
+            owner_repo = self._extract_github_owner_repo(git_url)
+            if owner_repo:
+                owner, repo = owner_repo
+                # Try common changelog file names
+                changelog_files = [
+                    "CHANGELOG.md", "CHANGELOG.rst", "CHANGELOG.txt", "CHANGELOG",
+                    "CHANGES.md", "CHANGES.rst", "CHANGES.txt", "CHANGES",
+                    "NEWS.md", "NEWS.rst", "NEWS.txt", "NEWS",
+                    "HISTORY.md", "HISTORY.rst", "HISTORY.txt", "HISTORY",
+                ]
+
+                for filename in changelog_files:
+                    # Try main/master branches
+                    for branch in ["main", "master"]:
+                        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{filename}"
+                        content = self._fetch_url(raw_url)
+                        if content:
+                            section = self._extract_changelog_section(content, version)
+                            if section:
+                                return section
+
+        return None
+
+    def _extract_changelog_section(self, content: str, version: str) -> Optional[str]:
+        """Extract the section for a specific version from a changelog file."""
+        lines = content.split("\n")
+        section_lines = []
+        in_section = False
+        version_patterns = [
+            re.escape(version),
+            re.escape(f"v{version}"),
+            re.escape(f"V{version}"),
+        ]
+
+        version_regex = "|".join(version_patterns)
+
+        for line in lines:
+            # Check if this line starts a version section
+            # Common patterns: ## 1.2.3, ## [1.2.3], # Version 1.2.3, 1.2.3 (date), etc.
+            if re.search(rf"^#{{1,3}}\s*\[?({version_regex})\]?", line) or \
+               re.search(rf"^({version_regex})\s*[\(\[]", line) or \
+               re.search(rf"^Version\s+({version_regex})", line, re.IGNORECASE):
+                in_section = True
+                section_lines.append(line)
+                continue
+
+            if in_section:
+                # Check if we've hit the next version section
+                if re.match(r"^#{{1,3}}\s*\[?\d+\.\d+", line) or \
+                   re.match(r"^\d+\.\d+\.\d+\s*[\(\[]", line) or \
+                   re.match(r"^Version\s+\d+\.\d+", line, re.IGNORECASE):
+                    break
+                section_lines.append(line)
+
+        if section_lines:
+            return "\n".join(section_lines).strip()
+
+        return None
+
+    def _format_release_notes(self, body: str, title: str = "") -> str:
+        """Format release notes for use in RPM changelog."""
+        # Clean up markdown formatting for RPM changelog
+        lines = body.strip().split("\n")
+        formatted_lines = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Convert markdown headers to plain text
+            line = re.sub(r"^#{1,6}\s+", "", line)
+
+            # Convert markdown links to plain text
+            line = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", line)
+
+            # Keep bullet points but normalize them
+            if line.startswith(("- ", "* ", "+ ")):
+                line = "  * " + line[2:]
+            elif line.startswith(("- ", "* ", "+ ")) is False and formatted_lines:
+                # Continuation of previous bullet
+                if formatted_lines[-1].startswith("  * "):
+                    line = "    " + line
+
+            formatted_lines.append(line)
+
+        return "\n".join(formatted_lines)
+
+    def fetch_with_ai(self, package_name: str, url: str, version: str, from_version: Optional[str] = None) -> Optional[str]:
+        """Use AI to research and generate release notes."""
+        if not shutil.which(self.ai_provider):
+            return None
+
+        print_color(f"  Using AI to research changes for {package_name} {version}...", "blue")
+
+        version_range = f"from {from_version} to {version}" if from_version else f"for version {version}"
+
+        prompt = f"""Research the changes in {package_name} {version_range}.
+
+Package: {package_name}
+URL: {url}
+Target Version: {version}
+{f'Previous Version: {from_version}' if from_version else ''}
+
+Instructions:
+1. Look up the release notes, changelog, or commit history for this package
+2. Summarize the key changes (new features, bug fixes, breaking changes)
+3. Format your response as bullet points suitable for an RPM changelog
+4. Focus on user-visible changes, not internal refactoring
+5. Keep it concise but informative (aim for 3-10 bullet points)
+6. If there are security fixes, mention them prominently
+
+Output format (just the bullet points, no introduction):
+  * First change description
+  * Second change description
+  * etc.
+
+If you cannot find specific release notes, indicate that clearly."""
+
+        try:
+            result = run_cmd(
+                [self.ai_provider, "--print", prompt],
+                timeout=120,
+                check=False,
+            )
+
+            if result.returncode == 0 and result.stdout:
+                output = result.stdout.strip()
+                # Clean up the output - remove any preamble text
+                lines = output.split("\n")
+                bullet_lines = [l for l in lines if l.strip().startswith(("*", "-", "•"))]
+                if bullet_lines:
+                    # Normalize bullet format
+                    formatted = []
+                    for line in bullet_lines:
+                        line = line.strip()
+                        line = re.sub(r"^[\*\-\•]\s*", "  * ", line)
+                        formatted.append(line)
+                    return "\n".join(formatted)
+                # If no bullet points found, return the full output but clean it up
+                return output
+
+        except Exception as e:
+            print_color(f"  AI changelog generation failed: {e}", "yellow")
+
+        return None
+
+    def fetch_release_notes(
+        self,
+        package_name: str,
+        url: str,
+        version: str,
+        from_version: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Fetch release notes from various sources in order of preference.
+
+        Returns formatted release notes or None if nothing found.
+        """
+        print_color(f"  Fetching release notes for {package_name} {version}...", "blue")
+
+        # 1. Try GitHub releases
+        if "github.com" in url:
+            notes = self.fetch_github_release_notes(url, version)
+            if notes:
+                print_color("    Found GitHub release notes", "green")
+                return notes
+
+        # 2. Try GitLab releases
+        if "gitlab" in url or "git." in url:
+            notes = self.fetch_gitlab_release_notes(url, version)
+            if notes:
+                print_color("    Found GitLab release notes", "green")
+                return notes
+
+        # 3. Try CHANGELOG file in repo
+        notes = self.fetch_changelog_from_repo(url, version)
+        if notes:
+            print_color("    Found notes in CHANGELOG file", "green")
+            return notes
+
+        # 4. Fall back to AI
+        print_color("    No release notes found, asking AI to research...", "yellow")
+        notes = self.fetch_with_ai(package_name, url, version, from_version)
+        if notes:
+            print_color("    AI generated changelog entries", "green")
+            return notes
+
+        return None
+
+
 class PackageUpdater:
     """Handles the actual package update process."""
 
@@ -777,6 +1088,7 @@ class PackageUpdater:
         self.ai_provider = ai_provider
         self.work_dir: Optional[Path] = None
         self.branch_project: Optional[str] = None
+        self.release_note_fetcher = ReleaseNoteFetcher(ai_provider)
         self.is_git_workflow = False
         self.service_parser: Optional[ServiceFileParser] = None
 
@@ -1347,27 +1659,121 @@ the package updater script, where they can apply the fix and retry.
 
         return False
 
+    def _get_upstream_url(self) -> Optional[str]:
+        """Get the upstream URL from service file or spec file."""
+        # First try service file
+        if self.service_parser and self.service_parser.url:
+            return self.service_parser.url
+
+        # Try to find spec file and extract URL
+        if self.work_dir:
+            spec_files = list(self.work_dir.glob("*.spec"))
+            for spec_file in spec_files:
+                try:
+                    content = spec_file.read_text()
+                    parser = SpecFileParser(content)
+                    if parser.url:
+                        return parser.url
+                except Exception:
+                    pass
+
+        return None
+
+    def _get_current_version(self) -> Optional[str]:
+        """Get the current package version from spec file."""
+        if self.work_dir:
+            spec_files = list(self.work_dir.glob("*.spec"))
+            for spec_file in spec_files:
+                try:
+                    content = spec_file.read_text()
+                    parser = SpecFileParser(content)
+                    if parser.version:
+                        return parser.version
+                except Exception:
+                    pass
+        return None
+
     def _create_changelog(self, message: Optional[str] = None) -> bool:
-        """Create a changelog entry using osc vc."""
+        """Create a changelog entry using osc vc with detailed release notes."""
         if not self.work_dir:
             return False
 
-        if not message:
-            if self.target_version:
-                message = f"Update to version {self.target_version}"
-            else:
-                message = "Update to latest version"
+        # Get upstream URL for fetching release notes
+        upstream_url = self._get_upstream_url()
+        current_version = self._get_current_version()
 
-        print_color(f"\nCreating changelog entry: {message}", "blue")
+        # Build the changelog message
+        if message:
+            # User provided a custom message, use it as-is
+            final_message = message
+        elif self.target_version:
+            # Fetch release notes
+            release_notes = None
+            if upstream_url:
+                release_notes = self.release_note_fetcher.fetch_release_notes(
+                    package_name=self.instance.package,
+                    url=upstream_url,
+                    version=self.target_version,
+                    from_version=current_version,
+                )
+
+            if release_notes:
+                # Build changelog with release notes
+                final_message = f"Update to version {self.target_version}:\n{release_notes}"
+            else:
+                # Fallback to simple message
+                final_message = f"Update to version {self.target_version}"
+        else:
+            final_message = "Update to latest version"
+
+        # Show the proposed changelog to user
+        print_color("\n" + "=" * 60, "cyan")
+        print_color("Proposed changelog entry:", "bold")
+        print_color("=" * 60, "cyan")
+        print(final_message)
+        print_color("=" * 60, "cyan")
+
+        # Allow user to edit or accept
+        print_color("\nOptions:", "yellow")
+        print("  [Enter] Accept this changelog")
+        print("  [e] Edit changelog message")
+        print("  [s] Use simple message (just 'Update to version X.Y.Z')")
+        print("  [c] Cancel changelog creation")
 
         try:
+            choice = input("\nChoice [Enter/e/s/c]: ").strip().lower()
+
+            if choice == "c":
+                print_color("  Changelog creation cancelled", "yellow")
+                return True  # Don't fail the whole process
+
+            if choice == "s":
+                final_message = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
+
+            if choice == "e":
+                # Let user edit in their editor
+                print_color("\nEnter your changelog message (end with a single '.' on a line):", "blue")
+                lines = []
+                while True:
+                    line = input()
+                    if line.strip() == ".":
+                        break
+                    lines.append(line)
+                if lines:
+                    final_message = "\n".join(lines)
+
+            print_color(f"\nCreating changelog entry...", "blue")
+
             # osc vc with -m for non-interactive mode
             run_cmd(
-                ["osc", "vc", "-m", message],
+                ["osc", "vc", "-m", final_message],
                 cwd=self.work_dir,
                 timeout=30,
             )
             print_color("  Changelog entry created", "green")
+            return True
+        except KeyboardInterrupt:
+            print_color("\n  Changelog creation skipped", "yellow")
             return True
         except Exception as e:
             print_color(f"  Failed to create changelog: {e}", "yellow")
@@ -2004,9 +2410,7 @@ the package updater script, where they can retry the build.
 
         # Step 2: Create/update changelog
         print_color("\nStep 2: Creating changelog...", "blue")
-        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
-        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
-        self._create_changelog(custom_msg)
+        self._create_changelog()
 
         # Step 3: Test build (optional)
         print_color("\nStep 3: Test build...", "blue")
@@ -2060,9 +2464,7 @@ the package updater script, where they can retry the build.
 
         # Step 2: Create changelog
         print_color("\nStep 2: Creating changelog...", "blue")
-        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
-        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
-        self._create_changelog(custom_msg)
+        self._create_changelog()
 
         # Step 3: Test build (optional)
         print_color("\nStep 3: Test build...", "blue")
@@ -2270,9 +2672,7 @@ the package updater script, where they can retry the build.
                 self.target_version = detected_version
 
         # Step 6: Create changelog
-        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
-        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
-        self._create_changelog(custom_msg)
+        self._create_changelog()
 
         # Step 7: Test build (optional)
         if self._confirm("Run a test build?", default_yes=True):
@@ -2559,9 +2959,7 @@ the package updater script, where they can retry the build.
 
         # Step 8: Create changelog
         print_color("\nStep 8: Creating changelog...", "blue")
-        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
-        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
-        self._create_changelog(custom_msg)
+        self._create_changelog()
 
         # Step 9: Test build (optional)
         print_color("\nStep 9: Test build...", "blue")
