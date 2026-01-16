@@ -1824,7 +1824,7 @@ the package updater script, where they can retry the build.
         self._create_changelog(custom_msg)
 
         # Step 7: Test build (optional)
-        if self._confirm("Run a test build?"):
+        if self._confirm("Run a test build?", default_yes=True):
             build_success, build_log = self._run_test_build()
             while not build_success:
                 try:
@@ -1983,7 +1983,7 @@ the package updater script, where they can retry the build.
         self._create_changelog(custom_msg)
 
         # Step 6: Test build (optional)
-        if self._confirm("Run a test build?"):
+        if self._confirm("Run a test build?", default_yes=True):
             build_success, build_log = self._run_test_build()
             while not build_success:
                 try:
