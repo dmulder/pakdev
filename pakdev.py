@@ -2362,7 +2362,10 @@ the package updater script, where they can retry the build.
             # Download each file
             for filename in files:
                 # Skip certain files that shouldn't be copied
-                if filename in ("_link", "_aggregate"):
+                # - _link, _aggregate: OBS internal files
+                # - *.changes: changelog history should not be copied between projects
+                if filename in ("_link", "_aggregate") or filename.endswith(".changes"):
+                    print(f"    Skipping {filename} (not copied between projects)")
                     continue
 
                 print(f"    Fetching {filename}...")
@@ -2422,9 +2425,14 @@ the package updater script, where they can retry the build.
                     capture=False,
                 )
 
-                # Copy files to dest_dir, excluding .git
+                # Copy files to dest_dir, excluding .git and .changes files
                 for item in clone_dir.iterdir():
+                    # Skip .git directory
                     if item.name == ".git":
+                        continue
+                    # Skip changelog files - history should not be copied between projects
+                    if item.name.endswith(".changes"):
+                        print(f"    Skipping {item.name} (not copied between projects)")
                         continue
                     if item.is_file():
                         shutil.copy2(item, dest_dir / item.name)
