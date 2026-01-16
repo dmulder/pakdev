@@ -2349,20 +2349,143 @@ the package updater script, where they can retry the build.
         print_color("  You can now review, build, and commit the changes.", "green")
         return True
 
+    def _setup_git_workspace(self) -> bool:
+        """Set up the git workspace for src-git workflow (steps 1-4).
+
+        Sets up: fork, clone, sync with upstream, create feature branch.
+        Populates: self.work_dir, self._feature_branch, self._tracking_branch, etc.
+        Returns True if successful.
+        """
+        pool_url = self.instance.src_git_url
+        if not pool_url:
+            print_color("  No src-git URL detected", "red")
+            return False
+
+        tracking_branch = self.instance.src_git_branch or "main"
+
+        # Parse the pool URL to construct SSH URLs
+        parsed = urllib.parse.urlparse(pool_url)
+        git_host = parsed.netloc
+        path_parts = parsed.path.strip("/").split("/")
+
+        if len(path_parts) < 2 or path_parts[0] != "pool":
+            print_color(f"  Unexpected pool URL format: {pool_url}", "red")
+            return False
+
+        package_name = path_parts[1]
+        pool_ssh_url = f"gitea@{git_host}:pool/{package_name}.git"
+
+        print_color(f"\nPool repository: {pool_ssh_url}", "blue")
+        print_color(f"Tracking branch: {tracking_branch}", "blue")
+
+        # Get username for the git host
+        print_color(f"\nStep 1: Setting up fork...", "blue")
+        username = self._get_git_username(git_host)
+        if not username:
+            print_color("  Username required for src-git workflow", "red")
+            return False
+
+        fork_url = f"gitea@{git_host}:{username}/{package_name}.git"
+        print_color(f"  Fork URL: {fork_url}", "blue")
+
+        # Check if fork exists
+        if self._check_fork_exists(fork_url):
+            print_color(f"  Fork exists", "green")
+        else:
+            print_color(f"  Fork does not exist at {fork_url}", "yellow")
+            print_color(f"  Please create a fork via: https://{git_host}/pool/{package_name}", "yellow")
+            if not self._confirm("Have you created the fork? Continue?"):
+                return False
+
+        # Clone the fork
+        print_color("\nStep 2: Cloning your fork...", "blue")
+        if not self._confirm("Proceed with cloning?"):
+            return False
+
+        self.work_dir = Path(tempfile.mkdtemp(prefix="pkg-update-"))
+        pkg_dir = self.work_dir / package_name
+
+        try:
+            run_cmd(
+                ["git", "clone", fork_url, str(pkg_dir)],
+                timeout=120,
+                capture=False,
+            )
+            self.work_dir = pkg_dir
+            print_color(f"  Cloned to: {self.work_dir}", "green")
+        except Exception as e:
+            print_color(f"  Clone failed: {e}", "red")
+            return False
+
+        # Add pool as upstream and sync
+        print_color("\nStep 3: Syncing with upstream pool...", "blue")
+        try:
+            run_cmd(
+                ["git", "remote", "add", "upstream", pool_ssh_url],
+                cwd=self.work_dir,
+                timeout=30,
+                check=False,
+            )
+            run_cmd(
+                ["git", "fetch", "upstream"],
+                cwd=self.work_dir,
+                timeout=120,
+                capture=False,
+            )
+            run_cmd(
+                ["git", "checkout", tracking_branch],
+                cwd=self.work_dir,
+                timeout=30,
+                check=False,
+            )
+            run_cmd(
+                ["git", "reset", "--hard", f"upstream/{tracking_branch}"],
+                cwd=self.work_dir,
+                timeout=30,
+            )
+            print_color(f"  Synced with upstream/{tracking_branch}", "green")
+        except Exception as e:
+            print_color(f"  Sync failed: {e}", "red")
+            if not self._confirm("Continue anyway?"):
+                return False
+
+        # Create feature branch
+        print_color("\nStep 4: Creating feature branch...", "blue")
+        branch_suffix = f"update-{self.target_version}" if self.target_version else "update"
+        feature_branch = f"{tracking_branch}-{branch_suffix}"
+        feature_branch = self._prompt_input("  Feature branch name", feature_branch)
+
+        try:
+            run_cmd(
+                ["git", "checkout", "-b", feature_branch],
+                cwd=self.work_dir,
+                timeout=30,
+            )
+            print_color(f"  Created branch: {feature_branch}", "green")
+        except Exception as e:
+            print_color(f"  Failed to create branch: {e}", "red")
+            return False
+
+        # Store for later use
+        self._feature_branch = feature_branch
+        self._tracking_branch = tracking_branch
+        self._pool_url = pool_url
+        self._pool_ssh_url = pool_ssh_url
+        self._fork_url = fork_url
+        self._git_host = git_host
+        self._package_name = package_name
+        self._git_username = username
+        self.is_git_workflow = True
+
+        return True
+
     def _copy_to_git_destination(self, source_dir: Path) -> bool:
         """Copy files to a git destination (src-git workflow)."""
-        # The git workflow sets up work_dir during update_srcgit_workflow
-        # We need to set it up here if not already done
+        # Set up git workspace if not already done
         if not self.work_dir:
-            print_color("\nSetting up git destination...", "blue")
-            # We need to run the fork setup from update_srcgit_workflow
-            # For now, just indicate the user should use the git workflow
-            print_color("  Git destination setup required.", "yellow")
-            print_color("  The files have been prepared. Continue with the git workflow?", "yellow")
-
-            # Store files for later use
-            self._source_files_dir = source_dir
-            return True
+            print_color("\nSetting up git workspace...", "blue")
+            if not self._setup_git_workspace():
+                return False
 
         # Copy files from source_dir to work_dir
         print_color("\nCopying files to git destination...", "blue")
@@ -2704,11 +2827,11 @@ the package updater script, where they can retry the build.
         return True
 
     def _get_git_username(self, git_host: str) -> Optional[str]:
-        """Get the username for a git host from git config or prompt."""
-        # Try to get from git config
+        """Get the username for a git host (for fork path, not authentication)."""
+        # Try to get from gitea-specific config first
         try:
             result = run_cmd(
-                ["git", "config", "--get", f"credential.https://{git_host}.username"],
+                ["git", "config", "--get", f"gitea.{git_host}.user"],
                 timeout=10,
                 check=False,
             )
@@ -2717,8 +2840,24 @@ the package updater script, where they can retry the build.
         except Exception:
             pass
 
-        # Prompt user
-        username = self._prompt_input(f"  Enter your username for {git_host}", "")
+        # Try OS username as default
+        default_user = os.environ.get("USER", "")
+
+        # Prompt user - clarify this is for the fork path, not auth
+        print_color(f"  Your fork will be at: gitea@{git_host}:<username>/{self.instance.package}.git", "blue")
+        username = self._prompt_input(f"  Enter your Gitea username for {git_host}", default_user)
+
+        # Optionally save for future use
+        if username:
+            try:
+                run_cmd(
+                    ["git", "config", "--global", f"gitea.{git_host}.user", username],
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                pass
+
         return username if username else None
 
     def _check_fork_exists(self, fork_url: str) -> bool:
@@ -2736,144 +2875,12 @@ the package updater script, where they can retry the build.
     def update_srcgit_workflow(self) -> bool:
         """Update package using src-git workflow."""
         print_color("\n=== src-git Workflow ===", "cyan")
-        self.is_git_workflow = True
 
-        pool_url = self.instance.src_git_url
-        if not pool_url:
-            print_color("  No src-git URL detected", "red")
+        # Set up git workspace (steps 1-4: fork, clone, sync, create branch)
+        if not self._setup_git_workspace():
             return False
 
-        is_internal = SRC_SUSE in pool_url
-        tracking_branch = self.instance.src_git_branch or "main"
-
-        print_color(f"\nPool repository: {pool_url}", "blue")
-        print_color(f"Tracking branch: {tracking_branch}", "blue")
-
-        # Parse the pool URL to construct fork URL
-        # Pool URL format: https://src.suse.de/pool/himmelblau
-        # Fork SSH URL format: gitea@src.suse.de:<username>/<package>.git
-        # Pool SSH URL format: gitea@src.suse.de:pool/<package>.git
-        parsed = urllib.parse.urlparse(pool_url)
-        git_host = parsed.netloc
-        path_parts = parsed.path.strip("/").split("/")
-
-        if len(path_parts) < 2 or path_parts[0] != "pool":
-            print_color(f"  Unexpected pool URL format: {pool_url}", "red")
-            print_color("  Expected format: https://src.suse.de/pool/<package>", "red")
-            return False
-
-        package_name = path_parts[1]
-
-        # Convert pool URL to SSH format for upstream remote
-        pool_ssh_url = f"gitea@{git_host}:pool/{package_name}.git"
-
-        # Get username for the git host
-        print_color(f"\nStep 1: Setting up fork...", "blue")
-        username = self._get_git_username(git_host)
-        if not username:
-            print_color("  Username required for src-git workflow", "red")
-            return False
-
-        # Use SSH URL format for fork
-        fork_url = f"gitea@{git_host}:{username}/{package_name}.git"
-        print_color(f"  Fork URL: {fork_url}", "blue")
-
-        # Check if fork exists
-        if self._check_fork_exists(fork_url):
-            print_color(f"  Fork exists", "green")
-        else:
-            print_color(f"  Fork does not exist at {fork_url}", "yellow")
-            print_color(f"  Please create a fork of {pool_url} at {fork_url}", "yellow")
-            print_color(f"  You can do this via the web interface at https://{git_host}", "yellow")
-            if not self._confirm("Have you created the fork? Continue?"):
-                return False
-
-        # Step 2: Clone the fork
-        print_color("\nStep 2: Cloning your fork...", "blue")
-        if not self._confirm("Proceed with cloning?"):
-            return False
-
-        self.work_dir = Path(tempfile.mkdtemp(prefix="pkg-update-"))
-        pkg_dir = self.work_dir / package_name
-
-        try:
-            run_cmd(
-                ["git", "clone", fork_url, str(pkg_dir)],
-                timeout=120,
-                capture=False,
-            )
-            self.work_dir = pkg_dir
-            print_color(f"  Cloned to: {self.work_dir}", "green")
-        except Exception as e:
-            print_color(f"  Clone failed: {e}", "red")
-            return False
-
-        # Step 3: Add pool as upstream and sync
-        print_color("\nStep 3: Syncing with upstream pool...", "blue")
-        try:
-            # Add upstream remote using SSH URL
-            run_cmd(
-                ["git", "remote", "add", "upstream", pool_ssh_url],
-                cwd=self.work_dir,
-                timeout=30,
-                check=False,  # May already exist
-            )
-
-            # Fetch from upstream
-            run_cmd(
-                ["git", "fetch", "upstream"],
-                cwd=self.work_dir,
-                timeout=120,
-                capture=False,
-            )
-
-            # Checkout tracking branch and sync with upstream
-            run_cmd(
-                ["git", "checkout", tracking_branch],
-                cwd=self.work_dir,
-                timeout=30,
-                check=False,
-            )
-
-            # Reset to upstream's tracking branch to ensure we're in sync
-            run_cmd(
-                ["git", "reset", "--hard", f"upstream/{tracking_branch}"],
-                cwd=self.work_dir,
-                timeout=30,
-            )
-
-            print_color(f"  Synced with upstream/{tracking_branch}", "green")
-        except Exception as e:
-            print_color(f"  Sync failed: {e}", "red")
-            if not self._confirm("Continue anyway?"):
-                return False
-
-        # Step 4: Create feature branch
-        print_color("\nStep 4: Creating feature branch...", "blue")
-        branch_suffix = f"update-{self.target_version}" if self.target_version else "update"
-        feature_branch = f"{tracking_branch}-{branch_suffix}"
-        feature_branch = self._prompt_input("  Feature branch name", feature_branch)
-
-        try:
-            run_cmd(
-                ["git", "checkout", "-b", feature_branch],
-                cwd=self.work_dir,
-                timeout=30,
-            )
-            print_color(f"  Created branch: {feature_branch}", "green")
-        except Exception as e:
-            print_color(f"  Failed to create branch: {e}", "red")
-            return False
-
-        # Store for later use in PR creation
-        self._feature_branch = feature_branch
-        self._tracking_branch = tracking_branch
-        self._pool_url = pool_url  # HTTPS URL for web links
-        self._pool_ssh_url = pool_ssh_url  # SSH URL for git operations
-        self._fork_url = fork_url  # SSH URL
-        self._git_host = git_host
-        self._package_name = package_name
-        self._git_username = username
+        is_internal = SRC_SUSE in (self.instance.src_git_url or "")
 
         # Step 5: Update _service file
         print_color("\nStep 5: Updating _service file...", "blue")
