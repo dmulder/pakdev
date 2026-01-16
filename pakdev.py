@@ -982,6 +982,146 @@ class PackageUpdater:
         print_color("  Could not detect version from spec/tarball", "yellow")
         return True, None  # Can't verify
 
+    def _handle_spec_only_version_fix(self, detected_version: Optional[str]) -> bool:
+        """Handle version mismatch for packages without _service files.
+
+        These packages typically need manual tarball download and spec file updates.
+        Returns True if changes were made and we should re-verify.
+        """
+        if not self.work_dir:
+            return False
+
+        print_color("  This package has no _service file.", "blue")
+        print_color("  Manual update required: download new tarball and update spec file.", "blue")
+
+        # Find spec file
+        spec_files = list(self.work_dir.glob("*.spec"))
+        if not spec_files:
+            print_color("  No spec file found!", "red")
+            return False
+
+        spec_file = spec_files[0]
+        spec_content = spec_file.read_text()
+        spec_parser = SpecFileParser(spec_content)
+
+        print_color(f"\n  Current spec file: {spec_file.name}", "blue")
+        print_color(f"  Current version in spec: {spec_parser.version}", "blue")
+        if spec_parser.url:
+            print_color(f"  Upstream URL: {spec_parser.url}", "blue")
+
+        # Show options
+        print_color("\n  Options:", "yellow")
+        print("    1. Get AI help to update the package")
+        print("    2. Open a shell to fix manually")
+        print("    3. Continue anyway (version mismatch)")
+        print("    4. Abort")
+
+        try:
+            choice = input("  Choice [1/2/3/4]: ").strip()
+            if choice == "1":
+                if self._run_ai_spec_update(spec_parser, detected_version):
+                    return True
+                # If AI didn't fix it, ask again
+                return self._handle_spec_only_version_fix(detected_version)
+            elif choice == "2":
+                self._open_workspace_shell()
+                if self._confirm("Did you update the package? Re-verify version?"):
+                    return True
+                return self._handle_spec_only_version_fix(detected_version)
+            elif choice == "3":
+                return False  # Continue without fixing
+            else:
+                raise KeyboardInterrupt
+        except (KeyboardInterrupt, EOFError):
+            print_color("  Aborted", "red")
+            raise
+
+        return False
+
+    def _run_ai_spec_update(self, spec_parser: SpecFileParser, detected_version: Optional[str]) -> bool:
+        """Launch interactive AI session to help update a spec-file-only package.
+
+        Returns True if the AI session resulted in changes that should be verified.
+        """
+        # Check if AI CLI is available
+        ai_cli = shutil.which(self.ai_provider)
+        if not ai_cli:
+            fallback = "gemini" if self.ai_provider == "claude" else "claude"
+            ai_cli = shutil.which(fallback)
+            if ai_cli:
+                self.ai_provider = fallback
+
+        if not ai_cli:
+            print_color("  No AI CLI available (claude or gemini)", "red")
+            return False
+
+        # Get spec file content
+        spec_content = ""
+        if self.work_dir:
+            spec_files = list(self.work_dir.glob("*.spec"))
+            if spec_files:
+                try:
+                    spec_content = spec_files[0].read_text()
+                except Exception:
+                    pass
+
+        # List files in workspace
+        file_list = ""
+        if self.work_dir:
+            try:
+                files = [f.name for f in self.work_dir.iterdir() if f.is_file()]
+                file_list = "\n".join(files)
+            except Exception:
+                pass
+
+        prompt = f"""I need to update an RPM package from version {detected_version} to version {self.target_version}.
+
+This package does NOT have a _service file, so it requires manual updates:
+1. Download the new source tarball for version {self.target_version}
+2. Update the Version: line in the spec file
+3. Update the Source0: URL if needed
+4. Remove the old tarball
+
+Package: {self.instance.package}
+Current version: {detected_version}
+Target version: {self.target_version}
+Upstream URL: {spec_parser.url or 'unknown'}
+Workspace: {self.work_dir}
+
+Files in workspace:
+{file_list}
+
+Here's the spec file:
+```
+{spec_content[:6000] if spec_content else '(could not read spec file)'}
+```
+
+Please help me update this package to version {self.target_version}. You can:
+1. Download the new tarball using curl or wget
+2. Edit the spec file to update the Version and Source0 lines
+3. Remove old tarballs
+4. Run 'osc addremove' to track file changes
+
+IMPORTANT: When you have completed the update or when the user indicates they are done,
+please tell them to type 'exit' or press Ctrl+D to exit this AI session and return to
+the package updater script, where they can verify the changes.
+"""
+
+        print_color("\n  Launching interactive AI session for spec update...", "blue")
+        print_color("  (Type 'exit' or press Ctrl+D when done to return to the updater)\n", "yellow")
+
+        try:
+            subprocess.run(
+                [self.ai_provider, prompt],
+                cwd=self.work_dir,
+            )
+        except Exception as e:
+            print_color(f"  AI session failed: {e}", "red")
+            return False
+
+        print_color("\n  AI session ended.", "blue")
+        return self._confirm("Re-verify the version?")
+
     def _diagnose_and_fix_version(self, detected_version: Optional[str]) -> bool:
         """Try to diagnose and fix version mismatch issues.
 
@@ -991,13 +1131,18 @@ class PackageUpdater:
             return False
 
         service_file = self.work_dir / "_service"
-        if not service_file.exists():
-            return False
+        has_service_file = service_file.exists()
 
-        content = service_file.read_text()
-        parser = ServiceFileParser(content)
+        parser = None
+        if has_service_file:
+            content = service_file.read_text()
+            parser = ServiceFileParser(content)
 
         print_color("\n  Diagnosing version mismatch...", "yellow")
+
+        # If no _service file, this is a spec-file-only package
+        if not has_service_file:
+            return self._handle_spec_only_version_fix(detected_version)
 
         # Check if it's a git tag naming issue
         if parser.scm == "git" and parser.url:
@@ -1631,48 +1776,54 @@ the package updater script, where they can retry the build.
         else:
             print_color("  No _service file found", "yellow")
 
-        # Step 4: Run osc service
-        if self._confirm("Run osc service mr to fetch sources?", default_yes=True):
-            if not self._run_osc_service():
-                if not self._confirm("Service failed. Continue anyway?"):
-                    return False
+        # Step 4: Run osc service (if _service file exists)
+        has_service_file = (self.work_dir / "_service").exists()
+        if has_service_file:
+            if self._confirm("Run osc service to fetch sources?", default_yes=True):
+                if not self._run_osc_service():
+                    if not self._confirm("Service failed. Continue anyway?"):
+                        return False
 
-            # Step 4b: Verify version matches
-            print_color("\nStep 4b: Verifying version...", "blue")
-            version_ok, detected_version = self._verify_version_after_service()
+        # Step 5: Verify version matches (always do this)
+        print_color("\nStep 5: Verifying version...", "blue")
+        version_ok, detected_version = self._verify_version_after_service()
 
-            # Loop to fix version issues
-            max_retries = 3
-            retry_count = 0
-            while not version_ok and retry_count < max_retries:
-                retry_count += 1
-                try:
-                    should_retry = self._diagnose_and_fix_version(detected_version)
-                    if should_retry:
-                        print_color(f"\nRetrying osc service mr (attempt {retry_count + 1})...", "blue")
+        # Loop to fix version issues
+        max_retries = 3
+        retry_count = 0
+        while not version_ok and retry_count < max_retries:
+            retry_count += 1
+            try:
+                should_retry = self._diagnose_and_fix_version(detected_version)
+                if should_retry:
+                    if has_service_file:
+                        print_color(f"\nRetrying osc service (attempt {retry_count + 1})...", "blue")
                         if self._run_osc_service():
                             version_ok, detected_version = self._verify_version_after_service()
                         else:
                             break
                     else:
-                        # User chose to continue without fixing
-                        break
-                except KeyboardInterrupt:
-                    print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
-                    return False
+                        # For spec-only packages, just re-verify
+                        version_ok, detected_version = self._verify_version_after_service()
+                else:
+                    # User chose to continue without fixing
+                    break
+            except KeyboardInterrupt:
+                print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
+                return False
 
-            if not version_ok:
-                print_color(f"\nWarning: Proceeding with version {detected_version} instead of {self.target_version}", "yellow")
-                if detected_version:
-                    # Update target_version to match what we actually got
-                    self.target_version = detected_version
+        if not version_ok:
+            print_color(f"\nWarning: Proceeding with version {detected_version} instead of {self.target_version}", "yellow")
+            if detected_version:
+                # Update target_version to match what we actually got
+                self.target_version = detected_version
 
-        # Step 5: Create changelog
+        # Step 6: Create changelog
         changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
         custom_msg = self._prompt_input("  Changelog message", changelog_msg)
         self._create_changelog(custom_msg)
 
-        # Step 6: Test build (optional)
+        # Step 7: Test build (optional)
         if self._confirm("Run a test build?"):
             build_success, build_log = self._run_test_build()
             while not build_success:
@@ -1687,14 +1838,14 @@ the package updater script, where they can retry the build.
                     print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
                     return False
 
-        # Step 7: Commit
+        # Step 8: Commit
         commit_msg = f"Update to {self.target_version}" if self.target_version else "Update to latest version"
         if self._confirm(f"Commit changes with message: '{commit_msg}'?", default_yes=True):
             if not self._osc_commit(commit_msg):
                 print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
                 return False
 
-        # Step 8: Submit request
+        # Step 9: Submit request
         if self._confirm("Create submit request to upstream?", default_yes=True):
             self._osc_submitrequest()
 
@@ -1784,48 +1935,54 @@ the package updater script, where they can retry the build.
         else:
             print_color("  No _service file found", "yellow")
 
-        # Step 3: Run osc service
-        if self._confirm("Run osc service mr to fetch sources?", default_yes=True):
-            if not self._run_osc_service():
-                if not self._confirm("Service failed. Continue anyway?"):
-                    return False
+        # Step 3: Run osc service (if _service file exists)
+        has_service_file = (self.work_dir / "_service").exists()
+        if has_service_file:
+            if self._confirm("Run osc service to fetch sources?", default_yes=True):
+                if not self._run_osc_service():
+                    if not self._confirm("Service failed. Continue anyway?"):
+                        return False
 
-            # Step 3b: Verify version matches
-            print_color("\nStep 3b: Verifying version...", "blue")
-            version_ok, detected_version = self._verify_version_after_service()
+        # Step 4: Verify version matches (always do this)
+        print_color("\nStep 4: Verifying version...", "blue")
+        version_ok, detected_version = self._verify_version_after_service()
 
-            # Loop to fix version issues
-            max_retries = 3
-            retry_count = 0
-            while not version_ok and retry_count < max_retries:
-                retry_count += 1
-                try:
-                    should_retry = self._diagnose_and_fix_version(detected_version)
-                    if should_retry:
-                        print_color(f"\nRetrying osc service mr (attempt {retry_count + 1})...", "blue")
+        # Loop to fix version issues
+        max_retries = 3
+        retry_count = 0
+        while not version_ok and retry_count < max_retries:
+            retry_count += 1
+            try:
+                should_retry = self._diagnose_and_fix_version(detected_version)
+                if should_retry:
+                    if has_service_file:
+                        print_color(f"\nRetrying osc service (attempt {retry_count + 1})...", "blue")
                         if self._run_osc_service():
                             version_ok, detected_version = self._verify_version_after_service()
                         else:
                             break
                     else:
-                        # User chose to continue without fixing
-                        break
-                except KeyboardInterrupt:
-                    print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
-                    return False
+                        # For spec-only packages, just re-verify
+                        version_ok, detected_version = self._verify_version_after_service()
+                else:
+                    # User chose to continue without fixing
+                    break
+            except KeyboardInterrupt:
+                print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
+                return False
 
-            if not version_ok:
-                print_color(f"\nWarning: Proceeding with version {detected_version} instead of {self.target_version}", "yellow")
-                if detected_version:
-                    # Update target_version to match what we actually got
-                    self.target_version = detected_version
+        if not version_ok:
+            print_color(f"\nWarning: Proceeding with version {detected_version} instead of {self.target_version}", "yellow")
+            if detected_version:
+                # Update target_version to match what we actually got
+                self.target_version = detected_version
 
-        # Step 4: Create changelog
+        # Step 5: Create changelog
         changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
         custom_msg = self._prompt_input("  Changelog message", changelog_msg)
         self._create_changelog(custom_msg)
 
-        # Step 5: Test build (optional)
+        # Step 6: Test build (optional)
         if self._confirm("Run a test build?"):
             build_success, build_log = self._run_test_build()
             while not build_success:
@@ -1840,7 +1997,7 @@ the package updater script, where they can retry the build.
                     print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
                     return False
 
-        # Step 6: Commit and push/PR
+        # Step 7: Commit and push/PR
         commit_msg = f"Update to {self.target_version}" if self.target_version else "Update to latest version"
         if is_internal:
             action = "commit and push"
