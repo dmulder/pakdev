@@ -1767,12 +1767,16 @@ the package updater script, where they can apply the fix and retry.
         upstream_url = self._get_upstream_url()
         current_version = self._get_current_version()
 
+        # Find the .changes file
+        changes_files = list(self.work_dir.glob("*.changes"))
+        changes_file = changes_files[0] if changes_files else self.work_dir / f"{self.instance.package}.changes"
+
         # Build the changelog message
         if message:
             # User provided a custom message, use it as-is
             final_message = message
         elif self.target_version:
-            # Fetch release notes
+            # Try to fetch release notes automatically first
             release_notes = None
             if upstream_url:
                 release_notes = self.release_note_fetcher.fetch_release_notes(
@@ -1801,12 +1805,13 @@ the package updater script, where they can apply the fix and retry.
         # Allow user to edit or accept
         print_color("\nOptions:", "yellow")
         print("  [Enter] Accept this changelog")
-        print("  [e] Edit changelog message")
+        print("  [e] Edit changelog message manually")
+        print("  [a] Use interactive AI to generate changelog (recommended for major updates)")
         print("  [s] Use simple message (just 'Update to version X.Y.Z')")
         print("  [c] Cancel changelog creation")
 
         try:
-            choice = input("\nChoice [Enter/e/s/c]: ").strip().lower()
+            choice = input("\nChoice [Enter/e/a/s/c]: ").strip().lower()
 
             if choice == "c":
                 print_color("  Changelog creation cancelled", "yellow")
@@ -1815,7 +1820,7 @@ the package updater script, where they can apply the fix and retry.
             if choice == "s":
                 final_message = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
 
-            if choice == "e":
+            elif choice == "e":
                 # Let user edit in their editor
                 print_color("\nEnter your changelog message (end with a single '.' on a line):", "blue")
                 lines = []
@@ -1826,6 +1831,14 @@ the package updater script, where they can apply the fix and retry.
                     lines.append(line)
                 if lines:
                     final_message = "\n".join(lines)
+
+            elif choice == "a":
+                # Interactive AI changelog generation
+                if self._run_interactive_ai_changelog(changes_file, upstream_url, current_version):
+                    print_color("  Changelog updated by AI", "green")
+                    return True
+                else:
+                    print_color("  AI changelog generation cancelled, using proposed entry", "yellow")
 
             print_color(f"\nCreating changelog entry...", "blue")
 
@@ -1844,6 +1857,92 @@ the package updater script, where they can apply the fix and retry.
             print_color(f"  Failed to create changelog: {e}", "yellow")
             print_color("  You may need to run 'osc vc' manually", "yellow")
             return True  # Don't fail the whole process
+
+    def _run_interactive_ai_changelog(
+        self,
+        changes_file: Path,
+        upstream_url: Optional[str],
+        from_version: Optional[str],
+    ) -> bool:
+        """Run interactive AI session to generate changelog entry."""
+        if not shutil.which(self.ai_provider):
+            print_color(f"  AI CLI ({self.ai_provider}) not available", "red")
+            return False
+
+        # Get current timestamp in RPM changelog format
+        from datetime import datetime
+        timestamp = datetime.utcnow().strftime("%a %b %d %H:%M:%S UTC %Y")
+
+        # Try to get maintainer info
+        try:
+            result = run_cmd(["git", "config", "user.name"], timeout=5, check=False)
+            maintainer_name = result.stdout.strip() if result.returncode == 0 else "Unknown"
+            result = run_cmd(["git", "config", "user.email"], timeout=5, check=False)
+            maintainer_email = result.stdout.strip() if result.returncode == 0 else "unknown@example.com"
+        except Exception:
+            maintainer_name = os.environ.get("USER", "Unknown")
+            maintainer_email = "unknown@example.com"
+
+        version_info = ""
+        if from_version and self.target_version:
+            version_info = f"Previous version in this codestream: {from_version}\nTarget version: {self.target_version}"
+        elif self.target_version:
+            version_info = f"Target version: {self.target_version}"
+
+        prompt = f"""I need you to create an RPM changelog entry for updating {self.instance.package}.
+
+{version_info}
+Package upstream URL: {upstream_url or 'Unknown'}
+Changes file: {changes_file}
+
+Instructions:
+1. Search the GitHub/GitLab releases page for ALL versions between {from_version or 'the previous version'} and {self.target_version}
+2. Compile a comprehensive changelog covering all changes across these versions
+3. Filter OUT changes that only affect other distros (Ubuntu, Fedora, Debian fixes) - this is for openSUSE/SLE
+4. Focus on user-visible changes: new features, bug fixes, security fixes, breaking changes
+5. Format as bullet points starting with "- "
+
+The changelog entry format MUST be:
+-------------------------------------------------------------------
+{timestamp} - {maintainer_name} <{maintainer_email}>
+
+- Update to version {self.target_version}:
+- First change description
+- Second change description
+- etc.
+
+Once you have gathered the information and composed the changelog entry, use your Edit tool to add it to the TOP of the file: {changes_file}
+
+The new entry should be inserted at the very beginning of the file, BEFORE any existing entries.
+
+When you are done editing the file, tell the user to type 'exit' or '/exit' to continue with the package update process."""
+
+        print_color("\n" + "=" * 60, "cyan")
+        print_color("Starting interactive AI session for changelog generation", "bold")
+        print_color("=" * 60, "cyan")
+        print_color(f"\nThe AI will research releases and edit: {changes_file}", "blue")
+        print_color("You can guide the AI if needed (e.g., clarify version ranges, filtering)", "blue")
+        print_color("\nType 'exit' or '/exit' when the AI has finished editing the changelog.\n", "yellow")
+
+        try:
+            # Run AI interactively
+            subprocess.run(
+                [self.ai_provider, prompt],
+                cwd=self.work_dir,
+            )
+        except KeyboardInterrupt:
+            print_color("\n  AI session cancelled", "yellow")
+            return False
+        except Exception as e:
+            print_color(f"  AI session failed: {e}", "red")
+            return False
+
+        # Verify the changes file was modified
+        if changes_file.exists():
+            print_color("\n  AI session ended.", "blue")
+            return self._confirm("Accept the AI-generated changelog?", default_yes=True)
+
+        return False
 
     def _run_test_build(self, repo: str = "openSUSE_Tumbleweed", arch: str = "x86_64") -> tuple[bool, str]:
         """Run a local test build.
