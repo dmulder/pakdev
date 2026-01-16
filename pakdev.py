@@ -1244,25 +1244,33 @@ class PackageUpdater:
             except Exception as e:
                 print_color(f"  Warning: Could not remove _servicedata: {e}", "yellow")
 
-        # Remove old tarballs if we're updating to a specific version
+        # Remove old versioned tarballs if we're updating to a specific version
+        # Only remove tarballs that appear to be versioned source archives (contain version-like patterns)
+        # Preserve auxiliary tarballs like vendor.tar.zst, cargo_config.tar.gz, etc.
         if self.target_version:
+            # Pattern to detect versioned tarballs: name-X.Y.Z.tar.* or name_X.Y.Z.tar.*
+            version_pattern = re.compile(r'[-_]\d+\.\d+')
+
             for tarball in self.work_dir.glob("*.tar.*"):
-                # Check if it's an old version tarball
-                if self.target_version not in tarball.name:
-                    try:
-                        tarball.unlink()
-                        cleaned.append(tarball.name)
-                    except Exception as e:
-                        print_color(f"  Warning: Could not remove {tarball.name}: {e}", "yellow")
+                # Only consider tarballs that have a version number in their name
+                if version_pattern.search(tarball.name):
+                    # Check if it's an old version tarball (doesn't have target version)
+                    if self.target_version not in tarball.name:
+                        try:
+                            tarball.unlink()
+                            cleaned.append(tarball.name)
+                        except Exception as e:
+                            print_color(f"  Warning: Could not remove {tarball.name}: {e}", "yellow")
 
             # Also check for .tgz files
             for tarball in self.work_dir.glob("*.tgz"):
-                if self.target_version not in tarball.name:
-                    try:
-                        tarball.unlink()
-                        cleaned.append(tarball.name)
-                    except Exception as e:
-                        print_color(f"  Warning: Could not remove {tarball.name}: {e}", "yellow")
+                if version_pattern.search(tarball.name):
+                    if self.target_version not in tarball.name:
+                        try:
+                            tarball.unlink()
+                            cleaned.append(tarball.name)
+                        except Exception as e:
+                            print_color(f"  Warning: Could not remove {tarball.name}: {e}", "yellow")
 
         if cleaned:
             print_color(f"  Cleaned cached files: {', '.join(cleaned)}", "blue")
