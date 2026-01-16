@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2043,6 +2044,11 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
         print_color(f"\nRunning test build ({repo}/{arch})...", "blue")
         print_color("  This may take a while. Press Ctrl+C to skip.", "yellow")
 
+        # Create a temp file for capturing build output
+        log_file = tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False, prefix='pakdev_build_')
+        log_path = log_file.name
+        log_file.close()
+
         try:
             cmd = ["osc", "build", "--no-verify", repo, arch]
 
@@ -2050,29 +2056,53 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
             if self.is_git_workflow:
                 cmd = ["osc", "build", "--no-verify", f"--alternative-project={self.instance.project}", repo, arch]
 
-            # Run interactively (no stdout capture) to allow password prompts
+            # Use 'script' to run interactively while capturing output
+            # This allows password prompts to work while still logging
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
+            script_cmd = ["script", "-q", "-c", cmd_str, log_path]
+
             result = subprocess.run(
-                cmd,
+                script_cmd,
                 cwd=self.work_dir,
                 timeout=self.TIMEOUT_BUILD,
             )
 
+            # Read the captured log
+            build_log = ""
+            try:
+                with open(log_path, 'r', errors='replace') as f:
+                    build_log = f.read()
+            except Exception:
+                pass
+
             if result.returncode == 0:
                 print_color("\n  Build succeeded!", "green")
-                return True, ""
+                return True, build_log
             else:
                 print_color("\n  Build failed", "red")
-                return False, ""
+                return False, build_log
 
         except subprocess.TimeoutExpired:
             print_color("\n  Build timed out", "red")
-            return False, ""
+            build_log = ""
+            try:
+                with open(log_path, 'r', errors='replace') as f:
+                    build_log = f.read()
+            except Exception:
+                pass
+            return False, build_log
         except KeyboardInterrupt:
             print_color("\n  Build skipped by user", "yellow")
             return True, ""  # User chose to skip, not a failure
         except Exception as e:
             print_color(f"\n  Build error: {e}", "red")
             return False, str(e)
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(log_path)
+            except Exception:
+                pass
 
     def _handle_build_failure(self, build_log: str) -> bool:
         """Handle a build failure with options including AI diagnosis.
