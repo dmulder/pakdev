@@ -1027,6 +1027,61 @@ If you cannot find specific release notes, indicate that clearly."""
 
         return None
 
+    def _cleanup_with_ai(self, raw_notes: str, package_name: str, version: str) -> str:
+        """Use AI to clean up and format release notes for RPM changelog."""
+        if not shutil.which(self.ai_provider):
+            return raw_notes
+
+        prompt = f"""Clean up these release notes for an RPM changelog entry.
+
+Package: {package_name}
+Version: {version}
+
+Raw release notes:
+{raw_notes}
+
+Instructions:
+1. Convert to concise bullet points starting with "- " (dash space)
+2. Remove GitHub/GitLab specific formatting (PR numbers, contributor mentions, "What's Changed", "New Contributors", "Full Changelog" links)
+3. Focus on USER-VISIBLE changes: new features, bug fixes, security fixes, breaking changes
+4. Remove internal/CI changes unless they affect users
+5. Keep each bullet point to one line, be concise but informative
+6. If there are security fixes, list them first
+7. Remove any URLs or links
+8. Maximum 10 bullet points, prioritize the most important changes
+
+Output format (just the bullet points, nothing else):
+- First change
+- Second change
+- etc.
+
+Output ONLY the bullet points, no introduction or explanation."""
+
+        try:
+            result = run_cmd(
+                [self.ai_provider, "--print", prompt],
+                timeout=60,
+                check=False,
+            )
+
+            if result.returncode == 0 and result.stdout:
+                output = result.stdout.strip()
+                # Extract only lines that start with "-" or "*"
+                lines = output.split("\n")
+                bullet_lines = [l.strip() for l in lines if l.strip().startswith(("-", "*"))]
+                if bullet_lines:
+                    # Normalize to "- " format
+                    formatted = []
+                    for line in bullet_lines:
+                        line = re.sub(r"^[\*\-]\s*", "- ", line)
+                        formatted.append(line)
+                    return "\n".join(formatted)
+
+        except Exception:
+            pass
+
+        return raw_notes
+
     def fetch_release_notes(
         self,
         package_name: str,
@@ -1041,27 +1096,37 @@ If you cannot find specific release notes, indicate that clearly."""
         """
         print_color(f"  Fetching release notes for {package_name} {version}...", "blue")
 
+        raw_notes = None
+        source = None
+
         # 1. Try GitHub releases
         if "github.com" in url:
-            notes = self.fetch_github_release_notes(url, version)
-            if notes:
-                print_color("    Found GitHub release notes", "green")
-                return notes
+            raw_notes = self.fetch_github_release_notes(url, version)
+            if raw_notes:
+                source = "GitHub"
 
         # 2. Try GitLab releases
-        if "gitlab" in url or "git." in url:
-            notes = self.fetch_gitlab_release_notes(url, version)
-            if notes:
-                print_color("    Found GitLab release notes", "green")
-                return notes
+        if not raw_notes and ("gitlab" in url or "git." in url):
+            raw_notes = self.fetch_gitlab_release_notes(url, version)
+            if raw_notes:
+                source = "GitLab"
 
         # 3. Try CHANGELOG file in repo
-        notes = self.fetch_changelog_from_repo(url, version)
-        if notes:
-            print_color("    Found notes in CHANGELOG file", "green")
-            return notes
+        if not raw_notes:
+            raw_notes = self.fetch_changelog_from_repo(url, version)
+            if raw_notes:
+                source = "CHANGELOG file"
 
-        # 4. Fall back to AI
+        # If we found notes, clean them up with AI
+        if raw_notes and source:
+            print_color(f"    Found {source} release notes", "green")
+            print_color(f"    Formatting with AI...", "blue")
+            cleaned_notes = self._cleanup_with_ai(raw_notes, package_name, version)
+            if cleaned_notes != raw_notes:
+                print_color(f"    Release notes formatted", "green")
+            return cleaned_notes
+
+        # 4. Fall back to AI to research from scratch
         print_color("    No release notes found, asking AI to research...", "yellow")
         notes = self.fetch_with_ai(package_name, url, version, from_version)
         if notes:
@@ -1472,7 +1537,7 @@ the package updater script, where they can verify the changes.
             return False
 
         print_color("\n  AI session ended.", "blue")
-        return self._confirm("Re-verify the version?")
+        return self._confirm("Re-verify the version?", default_yes=True)
 
     def _diagnose_and_fix_version(self, detected_version: Optional[str]) -> bool:
         """Try to diagnose and fix version mismatch issues.
