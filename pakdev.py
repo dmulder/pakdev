@@ -2013,6 +2013,82 @@ the package updater script, where they can retry the build.
         return True
 
 
+def _fetch_instance_version(instance: PackageInstance) -> None:
+    """Fetch the version of a package instance from its spec file."""
+    if instance.version:
+        return  # Already have version
+
+    # List of spec file names to try
+    spec_names = [
+        f"{instance.package}.spec",
+        # Some packages have different naming conventions
+    ]
+
+    for spec_name in spec_names:
+        try:
+            result = run_cmd(
+                [
+                    "osc",
+                    "-A",
+                    instance.api_url,
+                    "cat",
+                    instance.project,
+                    instance.package,
+                    spec_name,
+                ],
+                timeout=30,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout:
+                parser = SpecFileParser(result.stdout)
+                if parser.version:
+                    instance.version = parser.version
+                    return
+        except Exception:
+            pass
+
+    # If standard names didn't work, list files and find any .spec file
+    try:
+        result = run_cmd(
+            [
+                "osc",
+                "-A",
+                instance.api_url,
+                "ls",
+                instance.project,
+                instance.package,
+            ],
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            for filename in result.stdout.strip().split("\n"):
+                if filename.endswith(".spec"):
+                    try:
+                        spec_result = run_cmd(
+                            [
+                                "osc",
+                                "-A",
+                                instance.api_url,
+                                "cat",
+                                instance.project,
+                                instance.package,
+                                filename,
+                            ],
+                            timeout=30,
+                            check=False,
+                        )
+                        if spec_result.returncode == 0 and spec_result.stdout:
+                            parser = SpecFileParser(spec_result.stdout)
+                            if parser.version:
+                                instance.version = parser.version
+                                return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
 def gather_package_info(
     package_name: str,
     searcher: PackageSearcher,
@@ -2033,14 +2109,16 @@ def gather_package_info(
 
     info.instances = obs_instances + ibs_instances
 
-    # Detect git workflow for each instance
-    print_color("\nDetecting workflows...", "blue")
+    # Detect git workflow and fetch versions for each instance
+    print_color("\nDetecting workflows and fetching versions...", "blue")
     for instance in info.instances:
         searcher.detect_git_workflow(instance)
-        if instance.is_git_managed:
-            print_color(f"  {instance.project}: git-managed", "green")
-        else:
-            print_color(f"  {instance.project}: traditional OBS", "blue")
+        # Fetch version from spec file
+        _fetch_instance_version(instance)
+
+        workflow = "git-managed" if instance.is_git_managed else "traditional OBS"
+        version_str = f" v{instance.version}" if instance.version else ""
+        print_color(f"  {instance.project}:{version_str} {workflow}", "blue")
 
     # Try packtrack for the devel project (usually network:idm or similar)
     # Find a good candidate project for packtrack lookup
@@ -2080,6 +2158,30 @@ def gather_package_info(
         if codestreams:
             info.codestreams = codestreams
             print_color(f"  Found {len(codestreams)} codestream(s)", "green")
+
+            # Deduplicate: remove OBS/IBS instances that are covered by packtrack codestreams
+            # This includes the codestream project itself and any branches of it
+            codestream_projects = {cs.codestream for cs in codestreams}
+
+            def is_covered_by_packtrack(instance: PackageInstance) -> bool:
+                """Check if an instance is already covered by packtrack codestreams."""
+                project = instance.project
+                # Direct match
+                if project in codestream_projects:
+                    return True
+                # Check if it's a branch of a codestream project
+                # Branches are typically: home:user:branches:ORIGINAL_PROJECT
+                for cs_project in codestream_projects:
+                    if f":branches:{cs_project}" in project:
+                        return True
+                return False
+
+            original_count = len(info.instances)
+            info.instances = [inst for inst in info.instances if not is_covered_by_packtrack(inst)]
+            removed_count = original_count - len(info.instances)
+            if removed_count > 0:
+                print_color(f"  Removed {removed_count} duplicate(s) covered by packtrack", "blue")
+
         if upstream_version:
             info.upstream_version_packtrack = upstream_version
             print_color(f"  Upstream version (release-monitoring.org): {upstream_version}", "green")
@@ -2247,7 +2349,7 @@ def select_update_target(
         if opt_type == "instance":
             inst = opt
             git_marker = " [GIT]" if inst.is_git_managed else ""
-            ver = f" v{inst.version}" if inst.version else ""
+            ver = f" (v{inst.version})" if inst.version else ""
             print(
                 f"  {idx}. [{inst.server.upper()}] {inst.project}/{inst.package}{ver}{git_marker}"
             )
