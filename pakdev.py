@@ -2035,8 +2035,6 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
         print_color(f"\nRunning test build ({repo}/{arch})...", "blue")
         print_color("  This may take a while. Press Ctrl+C to skip.", "yellow")
 
-        build_log_lines = []
-
         try:
             cmd = ["osc", "build", "--no-verify", repo, arch]
 
@@ -2044,36 +2042,24 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
             if self.is_git_workflow:
                 cmd = ["osc", "build", "--no-verify", f"--alternative-project={self.instance.project}", repo, arch]
 
-            process = subprocess.Popen(
+            # Run interactively (no stdout capture) to allow password prompts
+            result = subprocess.run(
                 cmd,
                 cwd=self.work_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+                timeout=self.TIMEOUT_BUILD,
             )
 
-            # Stream output and capture it
-            for line in process.stdout:
-                print(line, end="")
-                build_log_lines.append(line)
-
-            process.wait(timeout=self.TIMEOUT_BUILD)
-
-            build_log = "".join(build_log_lines)
-
-            if process.returncode == 0:
+            if result.returncode == 0:
                 print_color("\n  Build succeeded!", "green")
-                return True, build_log
+                return True, ""
             else:
                 print_color("\n  Build failed", "red")
-                return False, build_log
+                return False, ""
 
         except subprocess.TimeoutExpired:
-            process.kill()
             print_color("\n  Build timed out", "red")
-            return False, "".join(build_log_lines)
+            return False, ""
         except KeyboardInterrupt:
-            process.kill()
             print_color("\n  Build skipped by user", "yellow")
             return True, ""  # User chose to skip, not a failure
         except Exception as e:
