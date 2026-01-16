@@ -1951,7 +1951,7 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
                 "osc", "-A", self.instance.api_url, "repos",
                 self.instance.project, self.instance.package
             ]
-            result = run_cmd(cmd, capture_output=True, text=True, timeout=30)
+            result = run_cmd(cmd, timeout=30, check=False)
             if result.returncode == 0 and result.stdout:
                 # Parse output - each line is "repo arch" or just "repo"
                 repos = set()
@@ -3782,6 +3782,316 @@ def offer_copy_from_existing(
         return None
 
 
+def detect_workspace_info(workspace_path: Path) -> Optional[dict]:
+    """Detect information about an existing workspace.
+
+    Returns a dict with:
+        - package: package name
+        - project: OBS/IBS project
+        - api_url: OBS/IBS API URL
+        - is_git: whether it's a git workspace
+        - version: current version from spec/service file (if detectable)
+        - git_branch: current git branch (if git workspace)
+    """
+    if not workspace_path.exists() or not workspace_path.is_dir():
+        print_color(f"Error: Workspace not found: {workspace_path}", "red")
+        return None
+
+    info = {
+        "package": workspace_path.name,
+        "project": None,
+        "api_url": None,
+        "is_git": False,
+        "version": None,
+        "git_branch": None,
+        "src_git_url": None,
+    }
+
+    # Check if it's a git repository
+    git_dir = workspace_path / ".git"
+    if git_dir.exists():
+        info["is_git"] = True
+
+        # Get current branch
+        try:
+            result = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=workspace_path, timeout=10, check=False
+            )
+            if result.returncode == 0:
+                info["git_branch"] = result.stdout.strip()
+        except Exception:
+            pass
+
+        # Try to get upstream URL to identify the project
+        try:
+            result = run_cmd(
+                ["git", "remote", "get-url", "upstream"],
+                cwd=workspace_path, timeout=10, check=False
+            )
+            if result.returncode == 0:
+                info["src_git_url"] = result.stdout.strip()
+        except Exception:
+            pass
+
+        # For git workflow, we need to determine API URL from the git host
+        if info["src_git_url"]:
+            if "src.suse.de" in info["src_git_url"]:
+                info["api_url"] = IBS_API
+            elif "src.opensuse.org" in info["src_git_url"]:
+                info["api_url"] = OBS_API
+
+        # Try to infer project from branch name for src-git workflows
+        # Branch naming conventions:
+        #   slfo-main -> SUSE:SLFO:Main
+        #   slfo-1.1 -> SUSE:SLFO:Products:SLES:16.0 (approximate)
+        #   factory -> openSUSE:Factory
+        #   Branch might have suffix like -update-2.3.1, strip it
+        if info["git_branch"] and not info["project"]:
+            branch = info["git_branch"]
+            # Strip common suffixes like -update-X.Y.Z or -pkg-X.Y.Z
+            base_branch = re.sub(r'-(update|pkg)-[\d.]+.*$', '', branch)
+            base_branch = re.sub(r'-[a-f0-9]{7,}$', '', base_branch)  # Strip commit hashes
+
+            branch_to_project = {
+                "slfo-main": "SUSE:SLFO:Main",
+                "slfo-1.1": "SUSE:SLFO:Products:SLES:16.0",
+                "slfo-1.2": "SUSE:SLFO:Products:SLES:16.0",
+                "factory": "openSUSE:Factory",
+                "tumbleweed": "openSUSE:Tumbleweed",
+            }
+
+            if base_branch in branch_to_project:
+                info["project"] = branch_to_project[base_branch]
+
+    # Check for OBS/IBS checkout (.osc directory)
+    osc_dir = workspace_path / ".osc"
+    if osc_dir.exists():
+        # Read _apiurl file
+        apiurl_file = osc_dir / "_apiurl"
+        if apiurl_file.exists():
+            info["api_url"] = apiurl_file.read_text().strip()
+
+        # Read _project file
+        project_file = osc_dir / "_project"
+        if project_file.exists():
+            info["project"] = project_file.read_text().strip()
+
+        # Read _package file (should match directory name)
+        package_file = osc_dir / "_package"
+        if package_file.exists():
+            info["package"] = package_file.read_text().strip()
+
+    # Try to get version from spec file
+    spec_files = list(workspace_path.glob("*.spec"))
+    if spec_files:
+        try:
+            spec_content = spec_files[0].read_text()
+            for line in spec_content.split('\n'):
+                if line.strip().lower().startswith('version:'):
+                    info["version"] = line.split(':', 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    # Try to get version from _service file
+    service_file = workspace_path / "_service"
+    if service_file.exists() and not info["version"]:
+        try:
+            parser = ServiceFileParser(service_file)
+            info["version"] = parser.get_version()
+        except Exception:
+            pass
+
+    return info
+
+
+def resume_from_workspace(
+    workspace_path: Path,
+    ai_provider: str = "claude",
+) -> bool:
+    """Resume work from an existing workspace.
+
+    Prompts user for what actions to take, defaulting to N (opt-in).
+    Returns True if work was completed successfully.
+    """
+    print_color(f"\nResuming from workspace: {workspace_path}", "blue")
+
+    # Detect workspace info
+    ws_info = detect_workspace_info(workspace_path)
+    if not ws_info:
+        return False
+
+    print_color("\nDetected workspace information:", "bold")
+    print(f"  Package: {ws_info['package']}")
+    if ws_info["project"]:
+        print(f"  Project: {ws_info['project']}")
+    if ws_info["api_url"]:
+        server = "IBS" if "suse.de" in ws_info["api_url"] else "OBS"
+        print(f"  Server: {server} ({ws_info['api_url']})")
+    print(f"  Workflow: {'Git (src-git)' if ws_info['is_git'] else 'Traditional OBS'}")
+    if ws_info["git_branch"]:
+        print(f"  Git branch: {ws_info['git_branch']}")
+    if ws_info["version"]:
+        print(f"  Current version: {ws_info['version']}")
+
+    # Prompt for missing information needed for builds
+    try:
+        if not ws_info["api_url"]:
+            print_color("\n  Server not detected. Please select:", "yellow")
+            print("    1. IBS (api.suse.de) - internal SUSE builds")
+            print("    2. OBS (api.opensuse.org) - openSUSE builds")
+            choice = input("  Choice [1/2]: ").strip()
+            if choice == "1":
+                ws_info["api_url"] = IBS_API
+            else:
+                ws_info["api_url"] = OBS_API
+
+        if not ws_info["project"]:
+            print_color("\n  Project not detected.", "yellow")
+            project = input("  Enter OBS/IBS project (e.g., SUSE:SLFO:Main): ").strip()
+            if project:
+                ws_info["project"] = project
+            else:
+                print_color("  Warning: No project specified. Build and submit will fail.", "yellow")
+                ws_info["project"] = "unknown"
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+
+    # Create a minimal PackageInstance for the updater
+    instance = PackageInstance(
+        server="ibs" if ws_info["api_url"] and "suse.de" in ws_info["api_url"] else "obs",
+        api_url=ws_info["api_url"] or OBS_API,
+        project=ws_info["project"] or "unknown",
+        package=ws_info["package"],
+        version=ws_info["version"],
+        src_git_url=ws_info["src_git_url"],
+        src_git_branch=ws_info["git_branch"],
+    )
+
+    # Ask user for target version
+    print_color("\nResume options (default is N for all - opt in to what you need):", "yellow")
+
+    target_version = ws_info["version"] or ""
+    try:
+        new_version = input(f"\n  Target version [{target_version}]: ").strip()
+        if new_version:
+            target_version = new_version
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+
+    # Create the updater
+    updater = PackageUpdater(instance, target_version, ai_provider)
+    updater.work_dir = workspace_path
+    updater.is_git_workflow = ws_info["is_git"]
+
+    # Define available actions based on workflow type
+    actions = []
+
+    if ws_info["is_git"]:
+        actions = [
+            ("update_files", "Update source files (run osc service)?"),
+            ("changelog", "Update changelog?"),
+            ("build", "Run test build?"),
+            ("commit", "Commit and push changes?"),
+            ("pr", "Create pull request?"),
+            ("shell", "Open shell in workspace?"),
+        ]
+    else:
+        actions = [
+            ("update_files", "Update source files (run osc service)?"),
+            ("changelog", "Update changelog?"),
+            ("build", "Run test build?"),
+            ("commit", "Commit changes to OBS?"),
+            ("submit", "Create submit request?"),
+            ("shell", "Open shell in workspace?"),
+        ]
+
+    # Ask which actions to perform (default N)
+    selected_actions = set()
+    try:
+        for action_key, prompt in actions:
+            response = input(f"  {prompt} [y/N]: ").strip().lower()
+            if response in ("y", "yes"):
+                selected_actions.add(action_key)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+
+    if not selected_actions:
+        print_color("\nNo actions selected. Opening shell in workspace.", "yellow")
+        updater._open_workspace_shell()
+        return True
+
+    print_color(f"\nSelected actions: {', '.join(selected_actions)}", "blue")
+
+    # Execute selected actions
+    try:
+        if "update_files" in selected_actions:
+            print_color("\n--- Updating source files ---", "bold")
+            if ws_info["is_git"]:
+                # For git, run service in subdir if needed
+                if not updater._run_osc_service():
+                    if not updater._confirm("Service run failed. Continue anyway?"):
+                        return False
+            else:
+                if not updater._run_osc_service():
+                    if not updater._confirm("Service run failed. Continue anyway?"):
+                        return False
+
+        if "changelog" in selected_actions:
+            print_color("\n--- Updating changelog ---", "bold")
+            if not updater._create_changelog():
+                if not updater._confirm("Changelog update failed. Continue anyway?"):
+                    return False
+
+        if "build" in selected_actions:
+            print_color("\n--- Running test build ---", "bold")
+            build_success, build_log = updater._run_test_build()
+            if not build_success:
+                if updater._handle_build_failure(build_log):
+                    # Retry build
+                    build_success, _ = updater._run_test_build()
+                if not build_success:
+                    if not updater._confirm("Build failed. Continue anyway?"):
+                        return False
+
+        if "commit" in selected_actions:
+            print_color("\n--- Committing changes ---", "bold")
+            if ws_info["is_git"]:
+                if not updater._git_commit_and_push():
+                    if not updater._confirm("Commit/push failed. Continue anyway?"):
+                        return False
+            else:
+                # OBS commit
+                if not updater._osc_commit():
+                    if not updater._confirm("Commit failed. Continue anyway?"):
+                        return False
+
+        if "pr" in selected_actions and ws_info["is_git"]:
+            print_color("\n--- Creating pull request ---", "bold")
+            if not updater._create_pull_request():
+                print_color("Pull request creation failed.", "red")
+
+        if "submit" in selected_actions and not ws_info["is_git"]:
+            print_color("\n--- Creating submit request ---", "bold")
+            if not updater._create_submit_request():
+                print_color("Submit request creation failed.", "red")
+
+        if "shell" in selected_actions:
+            print_color("\n--- Opening shell ---", "bold")
+            updater._open_workspace_shell()
+
+        print_color("\nResume workflow completed!", "green")
+        return True
+
+    except KeyboardInterrupt:
+        print_color("\n\nAborted by user.", "yellow")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="General purpose package updater for OBS/IBS (pakdev)",
@@ -3791,11 +4101,13 @@ Examples:
   %(prog)s himmelblau                    # Search for himmelblau package
   %(prog)s samba --ai-provider gemini    # Use Gemini for version detection
   %(prog)s himmelblau --info-only        # Just show info, don't update
+  %(prog)s --resume /tmp/pkg-xxx/pkg     # Resume from existing workspace
   %(prog)s --help                        # Show this help
         """,
     )
     parser.add_argument(
         "package",
+        nargs="?",  # Optional when using --resume
         help="Name of the package to search for and update",
     )
     parser.add_argument(
@@ -3821,12 +4133,29 @@ Examples:
         action="store_true",
         help="Only display package info, don't offer to update",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        metavar="PATH",
+        help="Resume from an existing workspace directory (e.g., /tmp/pkg-update-xxx/package)",
+    )
 
     args = parser.parse_args()
 
     print_color("=" * 70, "cyan")
     print_color("  pakdev - Package Updater", "bold")
     print_color("=" * 70, "cyan")
+
+    # Handle resume mode - detect everything from workspace metadata
+    if args.resume:
+        workspace_path = Path(args.resume).resolve()
+        success = resume_from_workspace(workspace_path, args.ai_provider)
+        sys.exit(0 if success else 1)
+
+    # Validate that package is provided for normal mode
+    if not args.package:
+        print_color("Error: Package name is required (or use --resume with a workspace path)", "red")
+        sys.exit(1)
 
     # Initialize components
     searcher = PackageSearcher()
