@@ -1944,13 +1944,93 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
 
         return False
 
-    def _run_test_build(self, repo: str = "openSUSE_Tumbleweed", arch: str = "x86_64") -> tuple[bool, str]:
+    def _get_available_repositories(self) -> list[str]:
+        """Get list of available repositories for the project."""
+        try:
+            cmd = [
+                "osc", "-A", self.instance.api_url, "repos",
+                self.instance.project, self.instance.package
+            ]
+            result = run_cmd(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout:
+                # Parse output - each line is "repo arch" or just "repo"
+                repos = set()
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        parts = line.split()
+                        if parts:
+                            repos.add(parts[0])
+                return sorted(repos)
+        except Exception as e:
+            print_color(f"  Warning: Could not get repository list: {e}", "yellow")
+        return []
+
+    def _select_build_repository(self) -> Optional[str]:
+        """Select the best repository for test build, or let user choose.
+
+        Returns the selected repository name, or None to skip the build.
+        """
+        repos = self._get_available_repositories()
+
+        if not repos:
+            print_color("  Warning: Could not determine available repositories.", "yellow")
+            # Fall back to defaults based on server type
+            if self.instance.server == "ibs":
+                return "standard"
+            else:
+                return "openSUSE_Tumbleweed"
+
+        # Auto-select based on priority preferences
+        # For IBS/internal builds: prefer standard
+        # For OBS: prefer openSUSE_Tumbleweed, then openSUSE_Factory, then Leap
+        preferred_repos = []
+        if self.instance.server == "ibs":
+            preferred_repos = ["standard", "leap_16", "leap_15"]
+        else:
+            preferred_repos = ["openSUSE_Tumbleweed", "openSUSE_Factory", "Leap_15.6", "Leap_15.5"]
+
+        # Try to find a preferred repo
+        for pref in preferred_repos:
+            for repo in repos:
+                if repo.lower() == pref.lower() or repo.lower().startswith(pref.lower()):
+                    return repo
+
+        # No preferred repo found - ask user
+        print_color(f"\n  Available repositories for {self.instance.project}:", "blue")
+        for i, repo in enumerate(repos, 1):
+            print(f"    {i}. {repo}")
+        print(f"    {len(repos) + 1}. Skip test build")
+
+        try:
+            while True:
+                choice = input(f"  Select repository [1-{len(repos) + 1}]: ").strip()
+                if choice.isdigit():
+                    idx = int(choice)
+                    if 1 <= idx <= len(repos):
+                        return repos[idx - 1]
+                    elif idx == len(repos) + 1:
+                        return None  # Skip build
+                # Also accept repo name directly
+                if choice in repos:
+                    return choice
+                print_color(f"  Invalid selection. Enter 1-{len(repos) + 1} or repository name.", "yellow")
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+    def _run_test_build(self, repo: Optional[str] = None, arch: str = "x86_64") -> tuple[bool, str]:
         """Run a local test build.
 
         Returns (success, build_log) tuple.
         """
         if not self.work_dir:
             return False, ""
+
+        # Select repository if not provided
+        if repo is None:
+            repo = self._select_build_repository()
+            if repo is None:
+                print_color("  Build skipped by user", "yellow")
+                return True, ""  # User chose to skip, not a failure
 
         print_color(f"\nRunning test build ({repo}/{arch})...", "blue")
         print_color("  This may take a while. Press Ctrl+C to skip.", "yellow")
