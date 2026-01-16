@@ -85,6 +85,46 @@ def run_cmd(
         raise
 
 
+def normalize_version(version: str) -> str:
+    """
+    Normalize a version string for comparison.
+
+    Examples:
+        v2.3.1 -> 2.3.1
+        2.3.1+git0.2418ec2 -> 2.3.1
+        v2.3.1+git0.2418ec2 -> 2.3.1
+        1.4.2+git.0.52da279 -> 1.4.2
+        2.3.1~rc1 -> 2.3.1~rc1 (keep pre-release markers)
+        2.3.1-beta -> 2.3.1-beta (keep pre-release markers)
+    """
+    if not version:
+        return ""
+
+    # Remove leading 'v' or 'V'
+    normalized = re.sub(r'^[vV]', '', version.strip())
+
+    # Remove git suffix patterns: +git0.hash, +git.0.hash, .git0.hash
+    normalized = re.sub(r'[+.]git\.?\d*\.?[a-f0-9]+$', '', normalized, flags=re.IGNORECASE)
+
+    # Remove OBS revision suffixes like .1, .2 at the very end after version
+    # But be careful not to remove legitimate version parts like 2.3.1
+    # Only remove if it looks like an OBS build number (single digit after dash or tilde section)
+
+    return normalized
+
+
+def versions_match(version1: str, version2: str) -> bool:
+    """
+    Check if two version strings refer to the same base version.
+
+    Examples:
+        versions_match("2.3.1", "v2.3.1+git0.abc123") -> True
+        versions_match("1.4.2", "1.4.2+git.0.52da279") -> True
+        versions_match("2.3.1", "2.3.2") -> False
+    """
+    return normalize_version(version1) == normalize_version(version2)
+
+
 @dataclass
 class PackageInstance:
     """Represents a package instance in OBS or IBS."""
@@ -1669,6 +1709,391 @@ the package updater script, where they can retry the build.
                 print_color("  You can manually push or use git-obs pr create", "yellow")
                 return False
 
+    def copy_from_existing_instance(
+        self,
+        source: PackageInstance,
+        searcher: "PackageSearcher",
+    ) -> bool:
+        """
+        Copy package files from an existing instance that already has the target version.
+
+        Handles all combinations:
+        - OBS source -> OBS destination
+        - OBS source -> git destination
+        - git source -> OBS destination
+        - git source -> git destination
+        """
+        print_color("\n=== Copying from existing instance ===", "cyan")
+        print_color(f"  Source: {source.project}/{source.package}", "blue")
+        print_color(f"  Destination: {self.instance.project}/{self.instance.package}", "blue")
+
+        # Detect if source is git-managed
+        if source.src_git_url is None:
+            searcher.detect_git_workflow(source)
+
+        source_is_git = source.is_git_managed
+        dest_is_git = self.instance.is_git_managed
+
+        print_color(f"  Source workflow: {'git' if source_is_git else 'OBS'}", "blue")
+        print_color(f"  Destination workflow: {'git' if dest_is_git else 'OBS'}", "blue")
+
+        # Create temp directory for source files
+        source_dir = Path(tempfile.mkdtemp(prefix="pkg-source-"))
+
+        try:
+            # Step 1: Fetch source files
+            print_color("\nStep 1: Fetching source files...", "blue")
+            if source_is_git:
+                if not self._fetch_from_git_source(source, source_dir):
+                    return False
+            else:
+                if not self._fetch_from_obs_source(source, source_dir):
+                    return False
+
+            # List fetched files
+            files = list(source_dir.iterdir())
+            print_color(f"  Fetched {len(files)} files:", "green")
+            for f in files[:10]:
+                print(f"    - {f.name}")
+            if len(files) > 10:
+                print(f"    ... and {len(files) - 10} more")
+
+            # Step 2: Copy to destination
+            print_color("\nStep 2: Setting up destination...", "blue")
+            if dest_is_git:
+                return self._copy_to_git_destination(source_dir)
+            else:
+                return self._copy_to_obs_destination(source_dir)
+
+        except Exception as e:
+            print_color(f"  Copy failed: {e}", "red")
+            return False
+        finally:
+            # Clean up source temp dir
+            shutil.rmtree(source_dir, ignore_errors=True)
+
+    def _fetch_from_obs_source(self, source: PackageInstance, dest_dir: Path) -> bool:
+        """Fetch package files from an OBS instance."""
+        try:
+            # List files in the package
+            result = run_cmd(
+                [
+                    "osc", "-A", source.api_url, "ls",
+                    source.project, source.package,
+                ],
+                timeout=60,
+            )
+
+            files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+            if not files:
+                print_color("  No files found in source package", "red")
+                return False
+
+            # Download each file
+            for filename in files:
+                # Skip certain files that shouldn't be copied
+                if filename in ("_link", "_aggregate"):
+                    continue
+
+                print(f"    Fetching {filename}...")
+                try:
+                    result = run_cmd(
+                        [
+                            "osc", "-A", source.api_url, "cat",
+                            source.project, source.package, filename,
+                        ],
+                        timeout=120,
+                    )
+                    (dest_dir / filename).write_text(result.stdout)
+                except Exception as e:
+                    # Try binary mode for tarballs etc
+                    try:
+                        result = subprocess.run(
+                            [
+                                "osc", "-A", source.api_url, "cat",
+                                source.project, source.package, filename,
+                            ],
+                            capture_output=True,
+                            timeout=120,
+                        )
+                        if result.returncode == 0:
+                            (dest_dir / filename).write_bytes(result.stdout)
+                        else:
+                            print_color(f"    Warning: Could not fetch {filename}", "yellow")
+                    except Exception:
+                        print_color(f"    Warning: Could not fetch {filename}", "yellow")
+
+            return True
+        except Exception as e:
+            print_color(f"  Failed to fetch from OBS: {e}", "red")
+            return False
+
+    def _fetch_from_git_source(self, source: PackageInstance, dest_dir: Path) -> bool:
+        """Fetch package files from a git-managed source."""
+        try:
+            git_url = source.src_git_url
+            git_branch = source.src_git_branch or "main"
+
+            # Convert HTTPS URL to SSH if needed for src.suse.de
+            if SRC_SUSE in git_url and git_url.startswith("https://"):
+                # Parse and convert: https://src.suse.de/pool/pkg -> gitea@src.suse.de:pool/pkg.git
+                parsed = urllib.parse.urlparse(git_url)
+                path = parsed.path.strip("/")
+                git_url = f"gitea@{parsed.netloc}:{path}.git"
+
+            print(f"    Cloning {git_url} (branch: {git_branch})...")
+
+            # Clone to temp location
+            clone_dir = Path(tempfile.mkdtemp(prefix="pkg-git-clone-"))
+            try:
+                run_cmd(
+                    ["git", "clone", "--depth", "1", "-b", git_branch, git_url, str(clone_dir)],
+                    timeout=120,
+                    capture=False,
+                )
+
+                # Copy files to dest_dir, excluding .git
+                for item in clone_dir.iterdir():
+                    if item.name == ".git":
+                        continue
+                    if item.is_file():
+                        shutil.copy2(item, dest_dir / item.name)
+                    else:
+                        shutil.copytree(item, dest_dir / item.name)
+
+                return True
+            finally:
+                shutil.rmtree(clone_dir, ignore_errors=True)
+
+        except Exception as e:
+            print_color(f"  Failed to fetch from git: {e}", "red")
+            return False
+
+    def _copy_to_obs_destination(self, source_dir: Path) -> bool:
+        """Copy files to an OBS destination (traditional workflow)."""
+        # First, ensure we have a working directory (branch the package)
+        if not self.work_dir:
+            print_color("\nBranching destination package...", "blue")
+            # Similar to update_obs_workflow step 1
+            try:
+                result = run_cmd(
+                    [
+                        "osc", "-A", self.instance.api_url, "branch",
+                        self.instance.project, self.instance.package,
+                    ],
+                    timeout=120,
+                    check=False,
+                )
+
+                if result.returncode != 0 and "already exists" not in (result.stderr or ""):
+                    print_color(f"  Branch failed: {result.stderr}", "red")
+                    return False
+
+                # Parse branch project
+                output = (result.stdout or "") + (result.stderr or "")
+                for line in output.split("\n"):
+                    if "osc co " in line:
+                        parts = line.split()
+                        for i, p in enumerate(parts):
+                            if p == "co" and i + 1 < len(parts):
+                                branch_path = parts[i + 1]
+                                if "/" in branch_path:
+                                    self.branch_project = branch_path.split("/")[0]
+                                break
+
+                if not self.branch_project:
+                    self.branch_project = f"home:{os.environ.get('USER', 'unknown')}:branches:{self.instance.project}"
+
+            except Exception as e:
+                print_color(f"  Branch failed: {e}", "red")
+                return False
+
+            # Checkout the branched package
+            self.work_dir = Path(tempfile.mkdtemp(prefix="pkg-update-"))
+            try:
+                run_cmd(
+                    [
+                        "osc", "-A", self.instance.api_url, "co",
+                        self.branch_project, self.instance.package,
+                        "-o", str(self.work_dir),
+                    ],
+                    timeout=120,
+                    capture=False,
+                )
+            except Exception as e:
+                print_color(f"  Checkout failed: {e}", "red")
+                return False
+
+        # Copy files from source_dir to work_dir
+        print_color("\nCopying files to destination...", "blue")
+        for item in source_dir.iterdir():
+            dest_path = self.work_dir / item.name
+            if dest_path.exists():
+                if dest_path.is_dir():
+                    shutil.rmtree(dest_path)
+                else:
+                    dest_path.unlink()
+            if item.is_file():
+                shutil.copy2(item, dest_path)
+            else:
+                shutil.copytree(item, dest_path)
+            print(f"    Copied {item.name}")
+
+        print_color(f"\n  Files copied to: {self.work_dir}", "green")
+        print_color("  You can now review, build, and commit the changes.", "green")
+        return True
+
+    def _copy_to_git_destination(self, source_dir: Path) -> bool:
+        """Copy files to a git destination (src-git workflow)."""
+        # The git workflow sets up work_dir during update_srcgit_workflow
+        # We need to set it up here if not already done
+        if not self.work_dir:
+            print_color("\nSetting up git destination...", "blue")
+            # We need to run the fork setup from update_srcgit_workflow
+            # For now, just indicate the user should use the git workflow
+            print_color("  Git destination setup required.", "yellow")
+            print_color("  The files have been prepared. Continue with the git workflow?", "yellow")
+
+            # Store files for later use
+            self._source_files_dir = source_dir
+            return True
+
+        # Copy files from source_dir to work_dir
+        print_color("\nCopying files to git destination...", "blue")
+        for item in source_dir.iterdir():
+            dest_path = self.work_dir / item.name
+            if dest_path.exists():
+                if dest_path.is_dir():
+                    shutil.rmtree(dest_path)
+                else:
+                    dest_path.unlink()
+            if item.is_file():
+                shutil.copy2(item, dest_path)
+            else:
+                shutil.copytree(item, dest_path)
+            print(f"    Copied {item.name}")
+
+        print_color(f"\n  Files copied to: {self.work_dir}", "green")
+        return True
+
+    def _continue_after_copy_obs(self) -> bool:
+        """Continue OBS workflow after copying files from another instance."""
+        print_color("\n=== Continuing OBS Workflow (after copy) ===", "cyan")
+        self.is_git_workflow = False
+
+        if not self.work_dir:
+            print_color("  No work directory set up", "red")
+            return False
+
+        # Parse service file if present
+        service_file = self.work_dir / "_service"
+        if service_file.exists():
+            content = service_file.read_text()
+            self.service_parser = ServiceFileParser(content)
+
+        # Clean up cached service files to ensure fresh state
+        self._clean_cached_service_files()
+
+        # Step 1: Verify version matches
+        print_color("\nStep 1: Verifying version...", "blue")
+        version_ok, detected_version = self._verify_version_after_service()
+        if not version_ok and detected_version:
+            print_color(f"  Note: Package is at version {detected_version}", "yellow")
+            if self.target_version:
+                self.target_version = detected_version
+
+        # Step 2: Create/update changelog
+        print_color("\nStep 2: Creating changelog...", "blue")
+        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
+        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
+        self._create_changelog(custom_msg)
+
+        # Step 3: Test build (optional)
+        print_color("\nStep 3: Test build...", "blue")
+        if self._confirm("Run a test build?", default_yes=True):
+            build_success, build_log = self._run_test_build()
+            while not build_success:
+                try:
+                    if self._handle_build_failure(build_log):
+                        build_success, build_log = self._run_test_build()
+                    else:
+                        break
+                except KeyboardInterrupt:
+                    print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
+                    return False
+
+        # Step 4: Commit and submit
+        print_color("\nStep 4: Commit and submit...", "blue")
+        if self._confirm("Ready to commit and create submit request?", default_yes=True):
+            return self._osc_commit_and_sr()
+
+        print_color(f"\nWorkspace: {self.work_dir}", "green")
+        return True
+
+    def _continue_after_copy_git(self) -> bool:
+        """Continue git workflow after copying files from another instance."""
+        print_color("\n=== Continuing Git Workflow (after copy) ===", "cyan")
+        self.is_git_workflow = True
+
+        if not self.work_dir:
+            print_color("  No work directory set up", "red")
+            return False
+
+        is_internal = SRC_SUSE in (self.instance.src_git_url or "")
+
+        # Parse service file if present
+        service_file = self.work_dir / "_service"
+        if service_file.exists():
+            content = service_file.read_text()
+            self.service_parser = ServiceFileParser(content)
+
+        # Clean up cached service files
+        self._clean_cached_service_files()
+
+        # Step 1: Verify version matches
+        print_color("\nStep 1: Verifying version...", "blue")
+        version_ok, detected_version = self._verify_version_after_service()
+        if not version_ok and detected_version:
+            print_color(f"  Note: Package is at version {detected_version}", "yellow")
+            if self.target_version:
+                self.target_version = detected_version
+
+        # Step 2: Create changelog
+        print_color("\nStep 2: Creating changelog...", "blue")
+        changelog_msg = f"Update to version {self.target_version}" if self.target_version else "Update to latest version"
+        custom_msg = self._prompt_input("  Changelog message", changelog_msg)
+        self._create_changelog(custom_msg)
+
+        # Step 3: Test build (optional)
+        print_color("\nStep 3: Test build...", "blue")
+        if self._confirm("Run a test build?", default_yes=True):
+            build_success, build_log = self._run_test_build()
+            while not build_success:
+                try:
+                    if self._handle_build_failure(build_log):
+                        build_success, build_log = self._run_test_build()
+                    else:
+                        break
+                except KeyboardInterrupt:
+                    print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
+                    return False
+
+        # Step 4: Commit and push/PR
+        print_color("\nStep 4: Commit and push...", "blue")
+        commit_msg = f"Update to {self.target_version}" if self.target_version else "Update to latest version"
+        if is_internal:
+            action = "commit and push"
+        else:
+            action = "commit and create PR"
+
+        if self._confirm(f"Ready to {action}. Proceed?", default_yes=True):
+            if not self._git_commit_and_push(commit_msg):
+                print_color(f"\nWorkspace preserved at: {self.work_dir}", "yellow")
+                return False
+
+        print_color(f"\nWorkspace: {self.work_dir}", "green")
+        return True
+
     def update_obs_workflow(self) -> bool:
         """Update package using traditional OBS workflow."""
         print_color("\n=== Traditional OBS Workflow ===", "cyan")
@@ -2477,6 +2902,43 @@ def display_package_info(info: PackageInfo):
     print()
 
 
+def find_instances_with_version(
+    info: PackageInfo,
+    target_version: str,
+    exclude_instance: Optional[PackageInstance] = None,
+) -> list[tuple[str, PackageInstance | CodestreamInfo]]:
+    """
+    Find all instances/codestreams that already have the target version.
+
+    Returns list of (source_type, instance_or_codestream) tuples.
+    source_type is "instance" or "codestream".
+    """
+    matches = []
+
+    if not target_version:
+        return matches
+
+    norm_target = normalize_version(target_version)
+
+    # Check instances
+    for inst in info.instances:
+        if inst.version and normalize_version(inst.version) == norm_target:
+            # Skip the instance we're updating
+            if exclude_instance and inst.project == exclude_instance.project:
+                continue
+            matches.append(("instance", inst))
+
+    # Check codestreams
+    for cs in info.codestreams:
+        if cs.version and normalize_version(cs.version) == norm_target:
+            # Skip if this codestream matches the excluded instance
+            if exclude_instance and cs.codestream == exclude_instance.project:
+                continue
+            matches.append(("codestream", cs))
+
+    return matches
+
+
 def select_update_target(
     info: PackageInfo,
     searcher: PackageSearcher,
@@ -2590,6 +3052,79 @@ def select_update_target(
     return selected_instance, version
 
 
+def offer_copy_from_existing(
+    info: PackageInfo,
+    target_instance: PackageInstance,
+    target_version: str,
+    searcher: PackageSearcher,
+) -> Optional[PackageInstance]:
+    """
+    Check if any existing instance has the target version and offer to copy from it.
+
+    Returns the source instance to copy from, or None if user declines or no match found.
+    """
+    if not target_version:
+        return None
+
+    # Find instances with the target version
+    matches = find_instances_with_version(info, target_version, target_instance)
+
+    if not matches:
+        return None
+
+    # Show matches to user
+    print_color("\n" + "=" * 70, "yellow")
+    print_color(f"  Found {len(matches)} instance(s) already at version {target_version}!", "yellow")
+    print_color("=" * 70, "yellow")
+
+    for i, (match_type, match) in enumerate(matches, 1):
+        if match_type == "instance":
+            inst = match
+            git_marker = " [GIT]" if inst.is_git_managed else ""
+            ver = f" (v{inst.version})" if inst.version else ""
+            print(f"  {i}. [{inst.server.upper()}] {inst.project}/{inst.package}{ver}{git_marker}")
+        else:
+            cs = match
+            print(f"  {i}. [{cs.server.upper()}] {cs.codestream} (v{cs.version}) [packtrack]")
+
+    print("  0. Skip - do normal update from upstream")
+
+    print_color("\nCopying from an existing instance avoids duplicate work!", "green")
+
+    try:
+        choice = input("\nCopy from which instance? [0 to skip]: ").strip()
+        if not choice or choice == "0":
+            return None
+
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(matches):
+            print_color("Invalid selection, skipping copy", "yellow")
+            return None
+
+        match_type, selected = matches[idx]
+
+        if match_type == "instance":
+            source_instance = selected
+        else:
+            # Convert codestream to PackageInstance
+            cs = selected
+            api_url = IBS_API if cs.server == "ibs" else OBS_API
+            source_instance = PackageInstance(
+                server=cs.server,
+                api_url=api_url,
+                project=cs.codestream,
+                package=info.name,
+                version=cs.version,
+            )
+            # Detect git workflow for source
+            searcher.detect_git_workflow(source_instance)
+
+        return source_instance
+
+    except (ValueError, KeyboardInterrupt, EOFError):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="General purpose package updater for OBS/IBS (pakdev)",
@@ -2698,13 +3233,41 @@ Examples:
     else:
         print_color("Target version: (next available)", "green")
 
+    # Check if another instance already has this version
+    source_instance = offer_copy_from_existing(info, instance, version, searcher)
+
     # Create updater and run appropriate workflow
     updater = PackageUpdater(instance, version, args.ai_provider)
 
-    if instance.is_git_managed:
-        updater.update_srcgit_workflow()
+    if source_instance:
+        # Copy from existing instance first
+        if updater.copy_from_existing_instance(source_instance, searcher):
+            print_color("\nFiles copied successfully!", "green")
+            print_color("Continuing with remaining workflow steps...", "blue")
+            # After copying, we still need to do changelog, build, commit, etc.
+            # The copy sets up work_dir, so we can continue with a simplified workflow
+            if instance.is_git_managed:
+                # For git: the work_dir may not be set up yet if copy_to_git_destination
+                # returned early. In that case, run the full workflow.
+                if updater.work_dir:
+                    updater._continue_after_copy_git()
+                else:
+                    updater.update_srcgit_workflow()
+            else:
+                # For OBS: work_dir is set up, continue with build/commit steps
+                updater._continue_after_copy_obs()
+        else:
+            print_color("\nCopy failed, falling back to normal workflow", "yellow")
+            if instance.is_git_managed:
+                updater.update_srcgit_workflow()
+            else:
+                updater.update_obs_workflow()
     else:
-        updater.update_obs_workflow()
+        # Normal workflow
+        if instance.is_git_managed:
+            updater.update_srcgit_workflow()
+        else:
+            updater.update_obs_workflow()
 
 
 if __name__ == "__main__":
