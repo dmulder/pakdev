@@ -1313,6 +1313,20 @@ class PackageUpdater:
         print_color("\nPreparing to run source services...", "blue")
         self._clean_cached_service_files()
 
+        # For git workflows, set the project metadata so osc service knows what project to use
+        if self.is_git_workflow:
+            print_color("  Setting git-obs metadata for src-git workflow...", "blue")
+            try:
+                # Set project and apiurl metadata
+                run_cmd(
+                    ["git-obs", "meta", "set",
+                     "--project", self.instance.project,
+                     "--apiurl", self.instance.api_url],
+                    cwd=self.work_dir, timeout=30, check=False
+                )
+            except Exception as e:
+                print_color(f"  Warning: Could not set git-obs metadata: {e}", "yellow")
+
         # Detect which service command to use
         service_mode = self._detect_service_mode()
 
