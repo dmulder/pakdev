@@ -2050,11 +2050,13 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
         log_file.close()
 
         try:
-            cmd = ["osc", "build", "--no-verify", repo, arch]
+            # Always specify API URL to ensure correct server is used
+            cmd = ["osc", "-A", self.instance.api_url, "build", "--no-verify", repo, arch]
 
             # For git workflow, use alternative project
             if self.is_git_workflow:
-                cmd = ["osc", "build", "--no-verify", f"--alternative-project={self.instance.project}", repo, arch]
+                cmd = ["osc", "-A", self.instance.api_url, "build", "--no-verify",
+                       f"--alternative-project={self.instance.project}", repo, arch]
 
             # Use 'script' to run interactively while capturing output
             # This allows password prompts to work while still logging
@@ -3847,18 +3849,23 @@ def detect_workspace_info(workspace_path: Path) -> Optional[dict]:
         except Exception:
             pass
 
-        # Try to get upstream URL to identify the project
-        try:
-            result = run_cmd(
-                ["git", "remote", "get-url", "upstream"],
-                cwd=workspace_path, timeout=10, check=False
-            )
-            if result.returncode == 0:
-                info["src_git_url"] = result.stdout.strip()
-        except Exception:
-            pass
+        # Try to get git remote URL to identify the server
+        # Check multiple remotes: upstream (preferred), origin, or any src.suse.de/src.opensuse.org remote
+        for remote_name in ["upstream", "origin"]:
+            try:
+                result = run_cmd(
+                    ["git", "remote", "get-url", remote_name],
+                    cwd=workspace_path, timeout=10, check=False
+                )
+                if result.returncode == 0:
+                    remote_url = result.stdout.strip()
+                    if "src.suse.de" in remote_url or "src.opensuse.org" in remote_url:
+                        info["src_git_url"] = remote_url
+                        break
+            except Exception:
+                pass
 
-        # For git workflow, we need to determine API URL from the git host
+        # For git workflow, determine API URL from the git host
         if info["src_git_url"]:
             if "src.suse.de" in info["src_git_url"]:
                 info["api_url"] = IBS_API
