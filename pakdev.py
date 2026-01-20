@@ -4002,7 +4002,7 @@ def resume_from_workspace(
     )
 
     # Ask user for target version
-    print_color("\nResume options (default is N for all - opt in to what you need):", "yellow")
+    print_color("\nResume workflow (default is N for all - opt in to what you need):", "yellow")
 
     target_version = ws_info["version"] or ""
     try:
@@ -4018,67 +4018,34 @@ def resume_from_workspace(
     updater.work_dir = workspace_path
     updater.is_git_workflow = ws_info["is_git"]
 
-    # Define available actions based on workflow type
-    actions = []
+    # Helper for yes/no prompts with default N
+    def ask_yn(prompt: str) -> bool:
+        try:
+            response = input(f"\n  {prompt} [y/N]: ").strip().lower()
+            return response in ("y", "yes")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            raise
 
-    if ws_info["is_git"]:
-        actions = [
-            ("update_files", "Update source files (run osc service)?"),
-            ("changelog", "Update changelog?"),
-            ("build", "Run test build?"),
-            ("commit", "Commit and push changes?"),
-            ("pr", "Create pull request?"),
-            ("shell", "Open shell in workspace?"),
-        ]
-    else:
-        actions = [
-            ("update_files", "Update source files (run osc service)?"),
-            ("changelog", "Update changelog?"),
-            ("build", "Run test build?"),
-            ("commit", "Commit changes to OBS?"),
-            ("submit", "Create submit request?"),
-            ("shell", "Open shell in workspace?"),
-        ]
-
-    # Ask which actions to perform (default N)
-    selected_actions = set()
+    # Interactive workflow - ask and execute each step immediately
     try:
-        for action_key, prompt in actions:
-            response = input(f"  {prompt} [y/N]: ").strip().lower()
-            if response in ("y", "yes"):
-                selected_actions.add(action_key)
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return False
-
-    if not selected_actions:
-        print_color("\nNo actions selected. Opening shell in workspace.", "yellow")
-        updater._open_workspace_shell()
-        return True
-
-    print_color(f"\nSelected actions: {', '.join(selected_actions)}", "blue")
-
-    # Execute selected actions
-    try:
-        if "update_files" in selected_actions:
+        # Step 1: Update source files
+        if ask_yn("Update source files (run osc service)?"):
             print_color("\n--- Updating source files ---", "bold")
-            if ws_info["is_git"]:
-                # For git, run service in subdir if needed
-                if not updater._run_osc_service():
-                    if not updater._confirm("Service run failed. Continue anyway?"):
-                        return False
-            else:
-                if not updater._run_osc_service():
-                    if not updater._confirm("Service run failed. Continue anyway?"):
-                        return False
+            if not updater._run_osc_service():
+                if not updater._confirm("Service run failed. Continue anyway?"):
+                    return False
 
-        if "changelog" in selected_actions:
+        # Step 2: Update changelog
+        if ask_yn("Update changelog?"):
             print_color("\n--- Updating changelog ---", "bold")
             if not updater._create_changelog():
                 if not updater._confirm("Changelog update failed. Continue anyway?"):
                     return False
 
-        if "build" in selected_actions:
+        # Step 3: Test build
+        build_success = True
+        if ask_yn("Run test build?"):
             print_color("\n--- Running test build ---", "bold")
             build_success, build_log = updater._run_test_build()
             if not build_success:
@@ -4089,29 +4056,38 @@ def resume_from_workspace(
                     if not updater._confirm("Build failed. Continue anyway?"):
                         return False
 
-        if "commit" in selected_actions:
-            print_color("\n--- Committing changes ---", "bold")
-            if ws_info["is_git"]:
+        # Step 4: Commit (only ask if build succeeded or was skipped)
+        commit_success = True
+        if ws_info["is_git"]:
+            if ask_yn("Commit and push changes?"):
+                print_color("\n--- Committing changes ---", "bold")
                 if not updater._git_commit_and_push():
+                    commit_success = False
                     if not updater._confirm("Commit/push failed. Continue anyway?"):
                         return False
-            else:
-                # OBS commit
+        else:
+            if ask_yn("Commit changes to OBS?"):
+                print_color("\n--- Committing changes ---", "bold")
                 if not updater._osc_commit():
+                    commit_success = False
                     if not updater._confirm("Commit failed. Continue anyway?"):
                         return False
 
-        if "pr" in selected_actions and ws_info["is_git"]:
-            print_color("\n--- Creating pull request ---", "bold")
-            if not updater._create_pull_request():
-                print_color("Pull request creation failed.", "red")
+        # Step 5: PR/Submit request (only ask if commit succeeded)
+        if commit_success:
+            if ws_info["is_git"]:
+                if ask_yn("Create pull request?"):
+                    print_color("\n--- Creating pull request ---", "bold")
+                    if not updater._create_pull_request():
+                        print_color("Pull request creation failed.", "red")
+            else:
+                if ask_yn("Create submit request?"):
+                    print_color("\n--- Creating submit request ---", "bold")
+                    if not updater._create_submit_request():
+                        print_color("Submit request creation failed.", "red")
 
-        if "submit" in selected_actions and not ws_info["is_git"]:
-            print_color("\n--- Creating submit request ---", "bold")
-            if not updater._create_submit_request():
-                print_color("Submit request creation failed.", "red")
-
-        if "shell" in selected_actions:
+        # Step 6: Shell (always offer at the end)
+        if ask_yn("Open shell in workspace?"):
             print_color("\n--- Opening shell ---", "bold")
             updater._open_workspace_shell()
 
