@@ -2060,8 +2060,10 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
 
             # Use 'script' to run interactively while capturing output
             # This allows password prompts to work while still logging
+            # -q: quiet mode (no script started/done messages)
+            # -e: return exit status of the child process
             cmd_str = " ".join(shlex.quote(c) for c in cmd)
-            script_cmd = ["script", "-q", "-c", cmd_str, log_path]
+            script_cmd = ["script", "-q", "-e", "-c", cmd_str, log_path]
 
             result = subprocess.run(
                 script_cmd,
