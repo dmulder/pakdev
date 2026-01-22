@@ -1408,11 +1408,8 @@ class PackageUpdater:
                     break
 
         if detected_version:
-            # Normalize versions for comparison (remove leading v, etc)
-            norm_target = re.sub(r'^[vV]', '', self.target_version)
-            norm_detected = re.sub(r'^[vV]', '', detected_version)
-
-            if norm_detected == norm_target:
+            # Use versions_match() which handles +git suffixes properly
+            if versions_match(detected_version, self.target_version):
                 print_color(f"  Version verified: {detected_version}", "green")
                 return True, detected_version
             else:
@@ -1968,11 +1965,17 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
         return False
 
     def _get_available_repositories(self) -> list[str]:
-        """Get list of available repositories for the project."""
+        """Get list of available repositories for the project.
+
+        Uses the branch project if available (since that's where the build runs),
+        otherwise falls back to the original instance project.
+        """
+        # Use branch project if we've branched, since that's where osc build runs
+        project = self.branch_project if self.branch_project else self.instance.project
         try:
             cmd = [
                 "osc", "-A", self.instance.api_url, "repos",
-                self.instance.project, self.instance.package
+                project, self.instance.package
             ]
             result = run_cmd(cmd, timeout=30, check=False)
             if result.returncode == 0 and result.stdout:
@@ -2019,7 +2022,8 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
                     return repo
 
         # No preferred repo found - ask user
-        print_color(f"\n  Available repositories for {self.instance.project}:", "blue")
+        project = self.branch_project if self.branch_project else self.instance.project
+        print_color(f"\n  Available repositories for {project}:", "blue")
         for i, repo in enumerate(repos, 1):
             print(f"    {i}. {repo}")
         print(f"    {len(repos) + 1}. Skip test build")
@@ -4064,13 +4068,17 @@ def resume_from_workspace(
         if ask_yn("Run test build?"):
             print_color("\n--- Running test build ---", "bold")
             build_success, build_log = updater._run_test_build()
-            if not build_success:
-                if updater._handle_build_failure(build_log):
-                    # Retry build
-                    build_success, _ = updater._run_test_build()
-                if not build_success:
-                    if not updater._confirm("Build failed. Continue anyway?"):
-                        return False
+            while not build_success:
+                try:
+                    if updater._handle_build_failure(build_log):
+                        # User wants to retry
+                        build_success, build_log = updater._run_test_build()
+                    else:
+                        # User chose to continue without successful build
+                        break
+                except KeyboardInterrupt:
+                    print_color(f"\nWorkspace preserved at: {updater.work_dir}", "yellow")
+                    return False
 
         # Step 4: Commit (only ask if build succeeded or was skipped)
         commit_success = True
