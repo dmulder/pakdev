@@ -4092,7 +4092,8 @@ def resume_from_workspace(
         else:
             if ask_yn("Commit changes to OBS?"):
                 print_color("\n--- Committing changes ---", "bold")
-                if not updater._osc_commit():
+                commit_msg = f"Update to {target_version}" if target_version else "Update to latest version"
+                if not updater._osc_commit(commit_msg):
                     commit_success = False
                     if not updater._confirm("Commit failed. Continue anyway?"):
                         return False
