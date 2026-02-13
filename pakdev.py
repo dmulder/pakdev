@@ -2547,7 +2547,7 @@ the package updater script, where they can retry the build.
             try:
                 run_cmd(
                     ["git", "clone", "--depth", "1", "-b", git_branch, git_url, str(clone_dir)],
-                    timeout=120,
+                    timeout=300,
                     capture=False,
                 )
 
