@@ -3,7 +3,7 @@
 General Purpose Package Updater Script (pakdev)
 
 Searches OBS and IBS for packages, gathers version information from multiple
-sources (packtrack, _service files, upstream), and assists with package updates
+sources (src.suse.de/pool, _service files, upstream), and assists with package updates
 using either traditional OBS workflow or src-git workflow.
 
 Usage:
@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
 import urllib.error
@@ -27,12 +29,10 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from html.parser import HTMLParser
 
 # API endpoints
 OBS_API = "https://api.opensuse.org"
 IBS_API = "https://api.suse.de"
-PACKTRACK_URL = "https://packtrack.suse.cz"
 
 # src-git endpoints
 SRC_OPENSUSE = "src.opensuse.org"
@@ -63,8 +63,14 @@ def run_cmd(
     timeout: int = TIMEOUT_SECONDS,
     capture: bool = True,
     check: bool = True,
+    env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
     """Run a command with timeout and error handling."""
+    cmd_env = None
+    if env:
+        cmd_env = os.environ.copy()
+        cmd_env.update(env)
+
     try:
         if capture:
             result = subprocess.run(
@@ -74,9 +80,12 @@ def run_cmd(
                 text=True,
                 timeout=timeout,
                 check=check,
+                env=cmd_env,
             )
         else:
-            result = subprocess.run(cmd, cwd=cwd, timeout=timeout, check=check)
+            result = subprocess.run(
+                cmd, cwd=cwd, timeout=timeout, check=check, env=cmd_env
+            )
         return result
     except subprocess.TimeoutExpired:
         print_color(f"Command timed out: {' '.join(cmd)}", "red")
@@ -155,13 +164,16 @@ class PackageInstance:
 
 @dataclass
 class CodestreamInfo:
-    """Information about a package in a specific codestream from packtrack."""
+    """Information about a package source project discovered from src.suse.de/pool."""
 
-    codestream: str  # e.g., "openSUSE:Factory", "SUSE:SLE-15-SP7:Update"
-    version: str
+    codestream: str  # OBS/IBS project, e.g. "openSUSE:Factory" or "SUSE:SLFO:1.3"
+    version: Optional[str]
     server: str  # "obs" or "ibs"
-    link: Optional[str] = None  # Link to the package in that codestream
+    link: Optional[str] = None  # Link to the source project/package
     bugs: Optional[int] = None
+    source_branch: Optional[str] = None
+    release: Optional[str] = None
+    mapped: bool = True
 
 
 @dataclass
@@ -184,102 +196,66 @@ class PackageInfo:
     upstream_versions: list[UpstreamVersion] = field(default_factory=list)
     upstream_url: Optional[str] = None  # From _service or spec file
     upstream_type: Optional[str] = None  # "github", "gitlab", "other"
-    upstream_version_packtrack: Optional[str] = None  # From release-monitoring.org
     devel_project: Optional[str] = None
     maintainers: list[str] = field(default_factory=list)
 
 
-class PacktrackHTMLParser(HTMLParser):
-    """Parse packtrack HTML page to extract codestream information."""
+@dataclass(frozen=True)
+class PoolBranchMapping:
+    """Mapping from src.suse.de pool branch names to OBS/IBS projects."""
 
-    def __init__(self):
-        super().__init__()
-        self.codestreams: list[CodestreamInfo] = []
-        self.upstream_version: Optional[str] = None
-        self._in_codestream_row = False
-        self._current_codestream: Optional[str] = None
-        self._current_server: Optional[str] = None
-        self._current_link: Optional[str] = None
-        self._in_version_td = False
-        self._current_version: Optional[str] = None
-        self._capture_upstream = False
+    project: str
+    server: str
+    release: str
 
-    def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
+    @property
+    def api_url(self) -> str:
+        return IBS_API if self.server == "ibs" else OBS_API
 
-        if tag == "tr" and "class" in attrs_dict:
-            if "codestream" in attrs_dict["class"]:
-                self._in_codestream_row = True
-                self._current_codestream = None
-                self._current_server = None
-                self._current_link = None
-                self._current_version = None
 
-        elif tag == "a" and self._in_codestream_row:
-            href = attrs_dict.get("href", "")
-            if "/package/show/" in href:
-                self._current_link = href
-                # Determine server from URL
-                if "build.suse.de" in href:
-                    self._current_server = "ibs"
-                else:
-                    self._current_server = "obs"
+POOL_BRANCH_MAPPINGS: dict[str, PoolBranchMapping] = {
+    "slfo-main": PoolBranchMapping(
+        project="SUSE:SLFO:Main",
+        server="ibs",
+        release="Next generation SLES code base",
+    ),
+    "slfo-1.3": PoolBranchMapping(
+        project="SUSE:SLFO:1.3",
+        server="ibs",
+        release="SLES 16.1 and openSUSE Leap 16.1 base packages",
+    ),
+    "slfo-1.2": PoolBranchMapping(
+        project="SUSE:SLFO:1.2",
+        server="ibs",
+        release="SLES 16.0 and openSUSE Leap 16.0 base packages",
+    ),
+    "factory": PoolBranchMapping(
+        project="openSUSE:Factory",
+        server="obs",
+        release="Package sources of openSUSE Factory/Tumbleweed",
+    ),
+    "leap-16.1": PoolBranchMapping(
+        project="openSUSE:Leap:16.1",
+        server="obs",
+        release="openSUSE Leap 16.1 and PackageHUB",
+    ),
+    "leap-16.0": PoolBranchMapping(
+        project="openSUSE:Leap:16.0",
+        server="obs",
+        release="openSUSE Leap 16.0 and PackageHUB",
+    ),
+}
 
-        elif tag == "td" and self._in_codestream_row:
-            css_class = attrs_dict.get("class", "")
-            if "centered" in css_class and not self._current_version:
-                self._in_version_td = True
 
-        elif tag == "span":
-            title = attrs_dict.get("title", "")
-            if title and self._capture_upstream:
-                # This might be the upstream version span
-                pass
+def get_pool_branch_base(branch: Optional[str]) -> Optional[str]:
+    """Return the configured pool branch prefix for a branch or feature branch."""
+    if not branch:
+        return None
 
-    def handle_endtag(self, tag):
-        if tag == "tr" and self._in_codestream_row:
-            # Save the codestream if we have all the info
-            if self._current_codestream and self._current_version:
-                self.codestreams.append(
-                    CodestreamInfo(
-                        codestream=self._current_codestream,
-                        version=self._current_version,
-                        server=self._current_server or "obs",
-                        link=self._current_link,
-                    )
-                )
-            self._in_codestream_row = False
-
-        elif tag == "td":
-            self._in_version_td = False
-
-    def handle_data(self, data):
-        data = data.strip()
-        if not data:
-            return
-
-        if self._in_codestream_row:
-            # Check if this is a codestream name (project:something pattern)
-            if ":" in data and not data.startswith("http"):
-                # Could be codestream name like "openSUSE:Factory" or "SUSE:SLE-15-SP7:Update"
-                if any(
-                    x in data
-                    for x in ["openSUSE:", "SUSE:", "home:", "network:", "devel:"]
-                ):
-                    self._current_codestream = data.strip()
-
-            elif self._in_version_td:
-                # This is the version
-                self._current_version = data.strip()
-
-        # Check for upstream version
-        if "upstream" in data.lower():
-            self._capture_upstream = True
-            # Try to extract version from "upstream X.Y.Z" pattern
-            match = re.search(r"upstream\s+([0-9][0-9a-zA-Z._-]*)", data, re.I)
-            if match:
-                self.upstream_version = match.group(1)
-            self._capture_upstream = False
+    for base_branch in sorted(POOL_BRANCH_MAPPINGS, key=len, reverse=True):
+        if branch == base_branch or branch.startswith(f"{base_branch}-"):
+            return base_branch
+    return None
 
 
 class PackageSearcher:
@@ -423,30 +399,136 @@ class PackageSearcher:
                     instance.src_git_branch = query_params["trackingbranch"][0]
 
 
-class PacktrackClient:
-    """Client for packtrack.suse.cz (screen scraping)."""
+class PoolSourceClient:
+    """Discover package source projects from authenticated src.suse.de pool git repos."""
 
-    def get_package_info(
-        self, server: str, project: str, package: str
-    ) -> tuple[list[CodestreamInfo], Optional[str]]:
-        """Scrape packtrack HTML page for package info."""
-        url = f"{PACKTRACK_URL}/package/{server}/{project}/{package}/"
+    def _pool_git_url(self, package: str) -> str:
+        return f"gitea@{SRC_SUSE}:pool/{package}.git"
+
+    def _pool_web_url(self, package: str) -> str:
+        return f"https://{SRC_SUSE}/pool/{package}"
+
+    def _run_git(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        git_env = {"GIT_SSH_COMMAND": "ssh -F /dev/null"}
+        result = run_cmd(cmd, check=False, env=git_env, **kwargs)
+        stderr = result.stderr or ""
+        if result.returncode != 0 and "Bad owner or permissions" in stderr:
+            result = run_cmd(
+                cmd,
+                check=False,
+                env=git_env,
+                **kwargs,
+            )
+        return result
+
+    def _run_git_binary(
+        self,
+        cmd: list[str],
+        timeout: int = TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env["GIT_SSH_COMMAND"] = "ssh -F /dev/null"
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+
+    def _list_pool_branches(self, package: str) -> Optional[list[str]]:
+        git_url = self._pool_git_url(package)
+        result = self._run_git(
+            ["git", "ls-remote", "--heads", git_url],
+            timeout=TIMEOUT_SECONDS,
+        )
+
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout or "unknown error").strip()
+            print_color(f"  Could not query src.suse.de pool repo: {error}", "yellow")
+            return None
+
+        branches = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            ref = parts[1]
+            prefix = "refs/heads/"
+            if ref.startswith(prefix):
+                branches.append(ref[len(prefix):])
+
+        return sorted(branches)
+
+    def _fetch_branch_version(self, package: str, branch: str) -> Optional[str]:
+        git_url = self._pool_git_url(package)
+        spec_name = f"{package}.spec"
+        try:
+            result = self._run_git_binary(
+                [
+                    "git",
+                    "archive",
+                    f"--remote={git_url}",
+                    branch,
+                    spec_name,
+                ],
+                timeout=TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+
+        if result.returncode != 0:
+            return None
 
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "pakdev/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
-                html = response.read().decode()
+            with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:*") as archive:
+                spec_member = archive.extractfile(spec_name)
+                if not spec_member:
+                    return None
+                parser = SpecFileParser(spec_member.read().decode())
+                return parser.version
+        except Exception:
+            return None
 
-            parser = PacktrackHTMLParser()
-            parser.feed(html)
+        return None
 
-            return parser.codestreams, parser.upstream_version
+    def get_package_info(self, package: str) -> list[CodestreamInfo]:
+        """Return mapped source projects and visible unmapped branches for a package."""
+        branches = self._list_pool_branches(package)
+        if branches is None:
+            return []
 
-        except Exception as e:
-            print_color(f"  Packtrack scrape failed: {e}", "yellow")
-            return [], None
+        sources: list[CodestreamInfo] = []
+        web_url = self._pool_web_url(package)
+        for branch in branches:
+            mapping = POOL_BRANCH_MAPPINGS.get(branch)
+            if mapping:
+                version = self._fetch_branch_version(package, branch)
+                sources.append(
+                    CodestreamInfo(
+                        codestream=mapping.project,
+                        version=version,
+                        server=mapping.server,
+                        link=f"{web_url}/src/branch/{branch}",
+                        source_branch=branch,
+                        release=mapping.release,
+                        mapped=True,
+                    )
+                )
+            else:
+                sources.append(
+                    CodestreamInfo(
+                        codestream=branch,
+                        version=None,
+                        server="",
+                        link=f"{web_url}/src/branch/{branch}",
+                        source_branch=branch,
+                        release="Unmapped pool branch",
+                        mapped=False,
+                    )
+                )
+
+        return sources
 
 
 class ServiceFileParser:
@@ -1778,6 +1860,63 @@ the package updater script, where they can apply the fix and retry.
                     pass
         return None
 
+    def _read_changes_top_entry(self, changes_file: Path) -> Optional[str]:
+        """Read the top changelog entry from a .changes file."""
+        if not changes_file.exists():
+            return None
+
+        try:
+            content = changes_file.read_text()
+        except Exception:
+            return None
+
+        lines = content.splitlines()
+        if not lines:
+            return None
+
+        def is_separator(line: str) -> bool:
+            stripped = line.strip()
+            return len(stripped) >= 10 and all(ch == "-" for ch in stripped)
+
+        start_index = None
+        for i, line in enumerate(lines):
+            if is_separator(line):
+                start_index = i
+                break
+
+        if start_index is None:
+            return None
+
+        end_index = None
+        for i in range(start_index + 1, len(lines)):
+            if is_separator(lines[i]):
+                end_index = i
+                break
+
+        entry_lines = lines[start_index:end_index] if end_index else lines[start_index:]
+        entry = "\n".join(entry_lines).strip("\n")
+        return entry or None
+
+    def _extract_version_from_changes_entry(self, entry: str) -> Optional[str]:
+        """Extract the version from a changelog entry."""
+        if not entry:
+            return None
+
+        patterns = [
+            r"Update to version\s+([0-9][0-9A-Za-z._~+-]*)",
+            r"Update to\s+v?([0-9][0-9A-Za-z._~+-]*)",
+            r"Version\s+([0-9][0-9A-Za-z._~+-]*)",
+        ]
+
+        for line in entry.splitlines():
+            line = line.strip()
+            for pattern in patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+
+        return None
+
     def _create_changelog(self, message: Optional[str] = None) -> bool:
         """Create a changelog entry using osc vc with detailed release notes."""
         if not self.work_dir:
@@ -1790,6 +1929,19 @@ the package updater script, where they can apply the fix and retry.
         # Find the .changes file
         changes_files = list(self.work_dir.glob("*.changes"))
         changes_file = changes_files[0] if changes_files else self.work_dir / f"{self.instance.package}.changes"
+
+        # If the top changelog entry already matches the target version, skip creation
+        if self.target_version and changes_file.exists():
+            top_entry = self._read_changes_top_entry(changes_file)
+            if top_entry:
+                entry_version = self._extract_version_from_changes_entry(top_entry)
+                if entry_version and versions_match(entry_version, self.target_version):
+                    print_color("\nChangelog already has an entry for this version; skipping creation.", "yellow")
+                    print_color("\nCurrent top changelog entry:", "bold")
+                    print_color("=" * 60, "cyan")
+                    print(top_entry)
+                    print_color("=" * 60, "cyan")
+                    return True
 
         # Build the changelog message
         if message:
@@ -1905,7 +2057,7 @@ the package updater script, where they can apply the fix and retry.
 
         version_info = ""
         if from_version and self.target_version:
-            version_info = f"Previous version in this codestream: {from_version}\nTarget version: {self.target_version}"
+            version_info = f"Previous version in this source project: {from_version}\nTarget version: {self.target_version}"
         elif self.target_version:
             version_info = f"Target version: {self.target_version}"
 
@@ -3378,7 +3530,7 @@ def _fetch_instance_version(instance: PackageInstance) -> None:
 def gather_package_info(
     package_name: str,
     searcher: PackageSearcher,
-    packtrack: PacktrackClient,
+    pool_sources: PoolSourceClient,
     version_detector: UpstreamVersionDetector,
 ) -> PackageInfo:
     """Gather all available information about a package."""
@@ -3406,71 +3558,41 @@ def gather_package_info(
         version_str = f" v{instance.version}" if instance.version else ""
         print_color(f"  {instance.project}:{version_str} {workflow}", "blue")
 
-    # Try packtrack for the devel project (usually network:idm or similar)
-    # Find a good candidate project for packtrack lookup
-    # Priority: devel projects (network:, devel:) > home projects > SUSE/openSUSE projects
-    packtrack_project = None
-    packtrack_priority = 0  # Higher is better
-
-    for instance in info.instances:
-        if instance.server == "obs":
-            project = instance.project
-            priority = 0
-
-            # Devel projects are highest priority
-            if project.startswith(("network:", "devel:")):
-                priority = 100
-            # Home projects of the maintainer might have good info
-            elif project.startswith("home:"):
-                priority = 10
-            # Factory and staging are lower priority
-            elif "Factory" in project or "Staging" in project:
-                priority = 1
-            # SUSE internal projects on OBS - lowest priority for packtrack
-            elif project.startswith("SUSE:"):
-                priority = 0
-            else:
-                priority = 50  # Unknown, give it medium priority
-
-            if priority > packtrack_priority:
-                packtrack_priority = priority
-                packtrack_project = project
-
-    if packtrack_project:
-        print_color(f"\nFetching packtrack info for {packtrack_project}...", "blue")
-        codestreams, upstream_version = packtrack.get_package_info(
-            "obs", packtrack_project, package_name
+    print_color("\nFetching source projects from src.suse.de/pool...", "blue")
+    source_projects = pool_sources.get_package_info(package_name)
+    if source_projects:
+        info.codestreams = source_projects
+        mapped_count = len([source for source in source_projects if source.mapped])
+        unmapped_count = len(source_projects) - mapped_count
+        print_color(
+            f"  Found {mapped_count} mapped source project(s)"
+            + (f" and {unmapped_count} unmapped branch(es)" if unmapped_count else ""),
+            "green",
         )
-        if codestreams:
-            info.codestreams = codestreams
-            print_color(f"  Found {len(codestreams)} codestream(s)", "green")
 
-            # Deduplicate: remove OBS/IBS instances that are covered by packtrack codestreams
-            # This includes the codestream project itself and any branches of it
-            codestream_projects = {cs.codestream for cs in codestreams}
+        source_project_names = {
+            source.codestream for source in source_projects if source.mapped
+        }
 
-            def is_covered_by_packtrack(instance: PackageInstance) -> bool:
-                """Check if an instance is already covered by packtrack codestreams."""
-                project = instance.project
-                # Direct match
-                if project in codestream_projects:
+        def is_covered_by_pool_source(instance: PackageInstance) -> bool:
+            project = instance.project
+            if project in source_project_names:
+                return True
+            for source_project in source_project_names:
+                if f":branches:{source_project}" in project:
                     return True
-                # Check if it's a branch of a codestream project
-                # Branches are typically: home:user:branches:ORIGINAL_PROJECT
-                for cs_project in codestream_projects:
-                    if f":branches:{cs_project}" in project:
-                        return True
-                return False
+            return False
 
-            original_count = len(info.instances)
-            info.instances = [inst for inst in info.instances if not is_covered_by_packtrack(inst)]
-            removed_count = original_count - len(info.instances)
-            if removed_count > 0:
-                print_color(f"  Removed {removed_count} duplicate(s) covered by packtrack", "blue")
-
-        if upstream_version:
-            info.upstream_version_packtrack = upstream_version
-            print_color(f"  Upstream version (release-monitoring.org): {upstream_version}", "green")
+        original_count = len(info.instances)
+        info.instances = [
+            inst for inst in info.instances if not is_covered_by_pool_source(inst)
+        ]
+        removed_count = original_count - len(info.instances)
+        if removed_count > 0:
+            print_color(
+                f"  Removed {removed_count} duplicate(s) covered by pool sources",
+                "blue",
+            )
 
     # Get _service file to find upstream URL
     print_color("\nFetching source information...", "blue")
@@ -3564,12 +3686,6 @@ def display_package_info(info: PackageInfo):
     if info.upstream_url:
         print_color(f"\nUpstream: {info.upstream_url}", "blue")
 
-    if info.upstream_version_packtrack:
-        print_color(
-            f"Latest upstream (release-monitoring.org): {info.upstream_version_packtrack}",
-            "green",
-        )
-
     # Display instances found via osc search
     if info.instances:
         print_color("\nPackage Instances (from osc search):", "bold")
@@ -3584,13 +3700,15 @@ def display_package_info(info: PackageInfo):
                 if inst.src_git_branch:
                     print(f"      Branch: {inst.src_git_branch}")
 
-    # Display codestreams from packtrack
+    # Display source projects discovered from src.suse.de/pool
     if info.codestreams:
-        print_color("\nCodestreams (from packtrack):", "bold")
+        print_color("\nSource Projects (from src.suse.de/pool):", "bold")
         for cs in info.codestreams:
-            server_tag = f"[{cs.server.upper()}]" if cs.server else ""
-            bugs_str = f" ({cs.bugs} bugs)" if cs.bugs else ""
-            print(f"  - {server_tag} {cs.codestream}: {cs.version}{bugs_str}")
+            server_tag = f"[{cs.server.upper()}]" if cs.server else "[unmapped]"
+            version = f": {cs.version}" if cs.version else ""
+            branch = f" ({cs.source_branch})" if cs.source_branch else ""
+            release = f" - {cs.release}" if cs.release else ""
+            print(f"  - {server_tag} {cs.codestream}{branch}{version}{release}")
 
     # Display upstream versions
     if info.upstream_versions:
@@ -3611,10 +3729,10 @@ def find_instances_with_version(
     exclude_instance: Optional[PackageInstance] = None,
 ) -> list[tuple[str, PackageInstance | CodestreamInfo]]:
     """
-    Find all instances/codestreams that already have the target version.
+    Find all instances/source projects that already have the target version.
 
-    Returns list of (source_type, instance_or_codestream) tuples.
-    source_type is "instance" or "codestream".
+    Returns list of (source_type, instance_or_source_project) tuples.
+    source_type is "instance" or "source_project".
     """
     matches = []
 
@@ -3631,13 +3749,12 @@ def find_instances_with_version(
                 continue
             matches.append(("instance", inst))
 
-    # Check codestreams
+    # Check source projects
     for cs in info.codestreams:
         if cs.version and normalize_version(cs.version) == norm_target:
-            # Skip if this codestream matches the excluded instance
             if exclude_instance and cs.codestream == exclude_instance.project:
                 continue
-            matches.append(("codestream", cs))
+            matches.append(("source_project", cs))
 
     return matches
 
@@ -3647,8 +3764,9 @@ def select_update_target(
     searcher: PackageSearcher,
 ) -> Optional[tuple[PackageInstance, str]]:
     """Let user select which instance to update and to which version."""
-    if not info.instances and not info.codestreams:
-        print_color("No package instances or codestreams found to update.", "red")
+    mapped_sources = [source for source in info.codestreams if source.mapped]
+    if not info.instances and not mapped_sources:
+        print_color("No package instances or mapped source projects found to update.", "red")
         return None
 
     # Build combined list of options
@@ -3658,13 +3776,13 @@ def select_update_target(
     for inst in info.instances:
         options.append(("instance", inst))
 
-    # Add codestreams from packtrack (that aren't already in instances)
+    # Add mapped source projects from src.suse.de/pool (that aren't already in instances)
     instance_projects = {inst.project for inst in info.instances}
-    for cs in info.codestreams:
+    for cs in mapped_sources:
         if cs.codestream not in instance_projects:
-            options.append(("codestream", cs))
+            options.append(("source_project", cs))
 
-    # Select instance/codestream
+    # Select instance/source project
     print_color("\nSelect package to update:", "yellow")
     print_color("  -- Package Instances (from osc search) --", "blue")
     idx = 1
@@ -3677,11 +3795,13 @@ def select_update_target(
                 f"  {idx}. [{inst.server.upper()}] {inst.project}/{inst.package}{ver}{git_marker}"
             )
         else:
-            # This is a codestream
+            # This is a mapped source project
             if idx == len(info.instances) + 1:
-                print_color("  -- Codestreams (from packtrack) --", "blue")
+                print_color("  -- Source Projects (from src.suse.de/pool) --", "blue")
             cs = opt
-            print(f"  {idx}. [{cs.server.upper()}] {cs.codestream} (v{cs.version})")
+            ver = f" (v{cs.version})" if cs.version else ""
+            branch = f" [{cs.source_branch}]" if cs.source_branch else ""
+            print(f"  {idx}. [{cs.server.upper()}] {cs.codestream}{ver}{branch} [GIT]")
         idx += 1
     print("  0. Cancel")
 
@@ -3699,7 +3819,7 @@ def select_update_target(
         if opt_type == "instance":
             selected_instance = selected
         else:
-            # Convert codestream to PackageInstance
+            # Convert mapped source project to a src-git PackageInstance
             cs = selected
             api_url = IBS_API if cs.server == "ibs" else OBS_API
             selected_instance = PackageInstance(
@@ -3708,17 +3828,13 @@ def select_update_target(
                 project=cs.codestream,
                 package=info.name,
                 version=cs.version,
+                src_git_url=f"https://{SRC_SUSE}/pool/{info.name}",
+                src_git_branch=cs.source_branch,
             )
-            # Detect git workflow for this instance
-            print_color(f"\nDetecting workflow for {cs.codestream}...", "blue")
-            searcher.detect_git_workflow(selected_instance)
-            if selected_instance.is_git_managed:
-                print_color(
-                    f"  Git-managed: {selected_instance.src_git_url} (branch: {selected_instance.src_git_branch})",
-                    "green",
-                )
-            else:
-                print_color("  Traditional OBS workflow", "blue")
+            print_color(
+                f"\nGit-managed: {selected_instance.src_git_url} (branch: {selected_instance.src_git_branch})",
+                "green",
+            )
 
     except (ValueError, KeyboardInterrupt, EOFError):
         return None
@@ -3788,7 +3904,8 @@ def offer_copy_from_existing(
             print(f"  {i}. [{inst.server.upper()}] {inst.project}/{inst.package}{ver}{git_marker}")
         else:
             cs = match
-            print(f"  {i}. [{cs.server.upper()}] {cs.codestream} (v{cs.version}) [packtrack]")
+            branch = f" [{cs.source_branch}]" if cs.source_branch else ""
+            print(f"  {i}. [{cs.server.upper()}] {cs.codestream} (v{cs.version}){branch} [pool]")
 
     print("  0. Skip - do normal update from upstream")
 
@@ -3809,7 +3926,7 @@ def offer_copy_from_existing(
         if match_type == "instance":
             source_instance = selected
         else:
-            # Convert codestream to PackageInstance
+            # Convert mapped source project to a src-git PackageInstance
             cs = selected
             api_url = IBS_API if cs.server == "ibs" else OBS_API
             source_instance = PackageInstance(
@@ -3818,9 +3935,9 @@ def offer_copy_from_existing(
                 project=cs.codestream,
                 package=info.name,
                 version=cs.version,
+                src_git_url=f"https://{SRC_SUSE}/pool/{info.name}",
+                src_git_branch=cs.source_branch,
             )
-            # Detect git workflow for source
-            searcher.detect_git_workflow(source_instance)
 
         return source_instance
 
@@ -3892,28 +4009,14 @@ def detect_workspace_info(workspace_path: Path) -> Optional[dict]:
             elif "src.opensuse.org" in info["src_git_url"]:
                 info["api_url"] = OBS_API
 
-        # Try to infer project from branch name for src-git workflows
-        # Branch naming conventions:
-        #   slfo-main -> SUSE:SLFO:Main
-        #   slfo-1.1 -> SUSE:SLFO:Products:SLES:16.0 (approximate)
-        #   factory -> openSUSE:Factory
-        #   Branch might have suffix like -update-2.3.1, strip it
+        # Try to infer project from branch name for src-git workflows.
+        # Feature branches keep the mapped pool branch as a prefix.
         if info["git_branch"] and not info["project"]:
-            branch = info["git_branch"]
-            # Strip common suffixes like -update-X.Y.Z or -pkg-X.Y.Z
-            base_branch = re.sub(r'-(update|pkg)-[\d.]+.*$', '', branch)
-            base_branch = re.sub(r'-[a-f0-9]{7,}$', '', base_branch)  # Strip commit hashes
-
-            branch_to_project = {
-                "slfo-main": "SUSE:SLFO:Main",
-                "slfo-1.1": "SUSE:SLFO:Products:SLES:16.0",
-                "slfo-1.2": "SUSE:SLFO:Products:SLES:16.0",
-                "factory": "openSUSE:Factory",
-                "tumbleweed": "openSUSE:Tumbleweed",
-            }
-
-            if base_branch in branch_to_project:
-                info["project"] = branch_to_project[base_branch]
+            base_branch = get_pool_branch_base(info["git_branch"])
+            if base_branch:
+                mapping = POOL_BRANCH_MAPPINGS[base_branch]
+                info["project"] = mapping.project
+                info["api_url"] = mapping.api_url
 
     # Check for OBS/IBS checkout (.osc directory)
     osc_dir = workspace_path / ".osc"
@@ -4201,7 +4304,7 @@ Examples:
         print_color("Error: Neither OBS nor IBS is available. Cannot proceed.", "red")
         sys.exit(1)
 
-    packtrack = PacktrackClient()
+    pool_sources = PoolSourceClient()
     version_detector = UpstreamVersionDetector(
         ai_provider=args.ai_provider,
         ai_cli_path=args.ai_cli_path,
@@ -4227,7 +4330,7 @@ Examples:
     info = gather_package_info(
         args.package,
         searcher,
-        packtrack,
+        pool_sources,
         version_detector if not args.skip_ai else UpstreamVersionDetector(),
     )
 
