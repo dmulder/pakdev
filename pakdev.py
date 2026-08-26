@@ -8,7 +8,7 @@ using either traditional OBS workflow or src-git workflow.
 
 Usage:
   python pkg_update.py <package_name>
-  python pkg_update.py himmelblau --ai-provider claude
+  python pkg_update.py himmelblau --ai-provider codex
   python pkg_update.py --help
 """
 
@@ -594,16 +594,121 @@ class SpecFileParser:
                 self.name = line.split(":", 1)[1].strip()
 
 
+AI_PROVIDERS = ("codex", "claude", "gemini")
+AI_FALLBACK_ORDER = ("codex", "claude", "gemini")
+
+
+class AIClient:
+    """Provider-specific wrapper for AI CLI interactions."""
+
+    def __init__(self, provider: str = "codex", cli_path: Optional[str] = None):
+        self.provider = provider
+        self.cli_path = cli_path or provider
+        self.explicit_cli_path = cli_path is not None
+
+    def is_available(self) -> bool:
+        return shutil.which(self.cli_path) is not None
+
+    def resolve_available(self) -> bool:
+        """Use the requested provider or fall back to another available provider."""
+        if self.is_available():
+            return True
+
+        if self.explicit_cli_path:
+            return False
+
+        for provider in AI_FALLBACK_ORDER:
+            if provider == self.provider:
+                continue
+            if shutil.which(provider):
+                print_color(
+                    f"Note: {self.provider} not found, using {provider}",
+                    "yellow",
+                )
+                self.provider = provider
+                self.cli_path = provider
+                return True
+
+        return False
+
+    def run_noninteractive(
+        self,
+        prompt: str,
+        timeout: int = 120,
+        web_search: bool = False,
+    ) -> subprocess.CompletedProcess:
+        if self.provider == "codex":
+            output_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, prefix="pakdev_codex_"
+            )
+            output_path = Path(output_file.name)
+            output_file.close()
+            cmd = [
+                self.cli_path,
+                "exec",
+                "--color",
+                "never",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--output-last-message",
+                str(output_path),
+            ]
+            if web_search:
+                cmd.append("--search")
+            cmd.append(prompt)
+
+            try:
+                result = run_cmd(cmd, timeout=timeout, check=False)
+                if result.returncode == 0 and output_path.exists():
+                    final_output = output_path.read_text().strip()
+                    if final_output:
+                        result.stdout = final_output
+                return result
+            finally:
+                try:
+                    output_path.unlink()
+                except Exception:
+                    pass
+
+        return run_cmd(
+            [self.cli_path, "--print", prompt],
+            timeout=timeout,
+            check=False,
+        )
+
+    def run_interactive(
+        self,
+        prompt: str,
+        cwd: Optional[Path] = None,
+    ) -> subprocess.CompletedProcess:
+        if self.provider == "codex":
+            cmd = [self.cli_path]
+            if cwd:
+                cmd.extend(["--cd", str(cwd)])
+            cmd.append(prompt)
+        else:
+            cmd = [self.cli_path, prompt]
+
+        return subprocess.run(cmd, cwd=cwd)
+
+
 class UpstreamVersionDetector:
     """Detect upstream versions using various methods including AI."""
 
-    def __init__(self, ai_provider: str = "claude", ai_cli_path: Optional[str] = None):
-        self.ai_provider = ai_provider
-        self.ai_cli_path = ai_cli_path or ai_provider
+    def __init__(
+        self,
+        ai_provider: str = "codex",
+        ai_cli_path: Optional[str] = None,
+        enable_ai: bool = True,
+    ):
+        self.ai_client = AIClient(ai_provider, ai_cli_path)
+        self.enable_ai = enable_ai
 
     def _is_ai_available(self) -> bool:
         """Check if AI CLI is available."""
-        return shutil.which(self.ai_cli_path) is not None
+        if not self.enable_ai:
+            return False
+        return self.ai_client.resolve_available()
 
     def _detect_source_type(self, url: str) -> str:
         """Detect the type of source repository."""
@@ -694,7 +799,10 @@ class UpstreamVersionDetector:
     ) -> list[UpstreamVersion]:
         """Use AI to detect upstream versions by analyzing web pages."""
         if not self._is_ai_available():
-            print_color(f"  AI CLI ({self.ai_provider}) not available", "yellow")
+            print_color(
+                f"  AI CLI ({self.ai_client.provider}) not available",
+                "yellow",
+            )
             return []
 
         source_type = self._detect_source_type(url)
@@ -721,10 +829,10 @@ Output your findings as a JSON array with this format:
 Only output the JSON array, no other text."""
 
         try:
-            result = run_cmd(
-                [self.ai_cli_path, "--print", prompt],
+            result = self.ai_client.run_noninteractive(
+                prompt,
                 timeout=120,
-                check=False,
+                web_search=True,
             )
 
             if result.returncode == 0 and result.stdout:
@@ -761,7 +869,7 @@ Only output the JSON array, no other text."""
             versions = self.detect_github_versions(url)
 
         # If no versions found or for other sources, try AI
-        if not versions:
+        if not versions and self.enable_ai:
             print_color("  Using AI to detect upstream versions...", "blue")
             versions = self.detect_with_ai(url, current_versions)
 
@@ -846,8 +954,8 @@ def find_git_tag_for_version(git_url: str, version: str) -> Optional[str]:
 class ReleaseNoteFetcher:
     """Fetch release notes from various upstream sources."""
 
-    def __init__(self, ai_provider: str = "claude"):
-        self.ai_provider = ai_provider
+    def __init__(self, ai_provider: str = "codex", ai_cli_path: Optional[str] = None):
+        self.ai_client = AIClient(ai_provider, ai_cli_path)
 
     def _fetch_url(self, url: str, headers: Optional[dict] = None) -> Optional[str]:
         """Fetch URL content."""
@@ -1053,7 +1161,7 @@ class ReleaseNoteFetcher:
 
     def fetch_with_ai(self, package_name: str, url: str, version: str, from_version: Optional[str] = None) -> Optional[str]:
         """Use AI to research and generate release notes."""
-        if not shutil.which(self.ai_provider):
+        if not self.ai_client.resolve_available():
             return None
 
         print_color(f"  Using AI to research changes for {package_name} {version}...", "blue")
@@ -1083,10 +1191,10 @@ Output format (just the bullet points, no introduction):
 If you cannot find specific release notes, indicate that clearly."""
 
         try:
-            result = run_cmd(
-                [self.ai_provider, "--print", prompt],
+            result = self.ai_client.run_noninteractive(
+                prompt,
                 timeout=120,
-                check=False,
+                web_search=True,
             )
 
             if result.returncode == 0 and result.stdout:
@@ -1112,7 +1220,7 @@ If you cannot find specific release notes, indicate that clearly."""
 
     def _cleanup_with_ai(self, raw_notes: str, package_name: str, version: str) -> str:
         """Use AI to clean up and format release notes for RPM changelog."""
-        if not shutil.which(self.ai_provider):
+        if not self.ai_client.resolve_available():
             return raw_notes
 
         prompt = f"""Clean up these release notes for an RPM changelog entry.
@@ -1141,10 +1249,9 @@ Output format (just the bullet points, nothing else):
 Output ONLY the bullet points, no introduction or explanation."""
 
         try:
-            result = run_cmd(
-                [self.ai_provider, "--print", prompt],
+            result = self.ai_client.run_noninteractive(
+                prompt,
                 timeout=60,
-                check=False,
             )
 
             if result.returncode == 0 and result.stdout:
@@ -1229,14 +1336,15 @@ class PackageUpdater:
         self,
         instance: PackageInstance,
         target_version: str,
-        ai_provider: str = "claude",
+        ai_provider: str = "codex",
+        ai_cli_path: Optional[str] = None,
     ):
         self.instance = instance
         self.target_version = target_version
-        self.ai_provider = ai_provider
+        self.ai_client = AIClient(ai_provider, ai_cli_path)
         self.work_dir: Optional[Path] = None
         self.branch_project: Optional[str] = None
-        self.release_note_fetcher = ReleaseNoteFetcher(ai_provider)
+        self.release_note_fetcher = ReleaseNoteFetcher(ai_provider, ai_cli_path)
         self.is_git_workflow = False
         self.service_parser: Optional[ServiceFileParser] = None
 
@@ -1562,16 +1670,8 @@ class PackageUpdater:
 
         Returns True if the AI session resulted in changes that should be verified.
         """
-        # Check if AI CLI is available
-        ai_cli = shutil.which(self.ai_provider)
-        if not ai_cli:
-            fallback = "gemini" if self.ai_provider == "claude" else "claude"
-            ai_cli = shutil.which(fallback)
-            if ai_cli:
-                self.ai_provider = fallback
-
-        if not ai_cli:
-            print_color("  No AI CLI available (claude or gemini)", "red")
+        if not self.ai_client.resolve_available():
+            print_color("  No supported AI CLI available", "red")
             return False
 
         # Get spec file content
@@ -1630,10 +1730,7 @@ the package updater script, where they can verify the changes.
         print_color("  (Type 'exit' or press Ctrl+D when done to return to the updater)\n", "yellow")
 
         try:
-            subprocess.run(
-                [self.ai_provider, prompt],
-                cwd=self.work_dir,
-            )
+            self.ai_client.run_interactive(prompt, cwd=self.work_dir)
         except Exception as e:
             print_color(f"  AI session failed: {e}", "red")
             return False
@@ -1747,17 +1844,8 @@ the package updater script, where they can verify the changes.
 
         Returns True if the AI session resulted in a fix that should be retried.
         """
-        # Check if AI CLI is available
-        ai_cli = shutil.which(self.ai_provider)
-        if not ai_cli:
-            # Try fallback
-            fallback = "gemini" if self.ai_provider == "claude" else "claude"
-            ai_cli = shutil.which(fallback)
-            if ai_cli:
-                self.ai_provider = fallback
-
-        if not ai_cli:
-            print_color("  No AI CLI available (claude or gemini)", "red")
+        if not self.ai_client.resolve_available():
+            print_color("  No supported AI CLI available", "red")
             return False
 
         # Build context for AI
@@ -1805,12 +1893,7 @@ the package updater script, where they can apply the fix and retry.
         print_color("  (Type 'exit' or press Ctrl+D when done to return to the updater)\n", "yellow")
 
         try:
-            # Run AI CLI interactively with initial prompt
-            # Pass prompt as positional argument (not -p which is --print for non-interactive)
-            subprocess.run(
-                [self.ai_provider, prompt],
-                cwd=self.work_dir,
-            )
+            self.ai_client.run_interactive(prompt, cwd=self.work_dir)
         except Exception as e:
             print_color(f"  AI session failed: {e}", "red")
             return False
@@ -2037,8 +2120,11 @@ the package updater script, where they can apply the fix and retry.
         from_version: Optional[str],
     ) -> bool:
         """Run interactive AI session to generate changelog entry."""
-        if not shutil.which(self.ai_provider):
-            print_color(f"  AI CLI ({self.ai_provider}) not available", "red")
+        if not self.ai_client.resolve_available():
+            print_color(
+                f"  AI CLI ({self.ai_client.provider}) not available",
+                "red",
+            )
             return False
 
         # Get current timestamp in RPM changelog format
@@ -2097,11 +2183,7 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
         print_color("\nType 'exit' or '/exit' when the AI has finished editing the changelog.\n", "yellow")
 
         try:
-            # Run AI interactively
-            subprocess.run(
-                [self.ai_provider, prompt],
-                cwd=self.work_dir,
-            )
+            self.ai_client.run_interactive(prompt, cwd=self.work_dir)
         except KeyboardInterrupt:
             print_color("\n  AI session cancelled", "yellow")
             return False
@@ -2330,17 +2412,8 @@ When you are done editing the file, tell the user to type 'exit' or '/exit' to c
 
         Returns True if the AI session resulted in a fix that should be retried.
         """
-        # Check if AI CLI is available
-        ai_cli = shutil.which(self.ai_provider)
-        if not ai_cli:
-            # Try fallback
-            fallback = "gemini" if self.ai_provider == "claude" else "claude"
-            ai_cli = shutil.which(fallback)
-            if ai_cli:
-                self.ai_provider = fallback
-
-        if not ai_cli:
-            print_color("  No AI CLI available (claude or gemini)", "red")
+        if not self.ai_client.resolve_available():
+            print_color("  No supported AI CLI available", "red")
             return False
 
         # Get the last portion of the build log (most relevant for errors)
@@ -2400,12 +2473,7 @@ the package updater script, where they can retry the build.
         print_color("  (Type 'exit' or press Ctrl+D when done to return to the updater)\n", "yellow")
 
         try:
-            # Run AI CLI interactively with initial prompt
-            # Pass prompt as positional argument (not -p which is --print for non-interactive)
-            subprocess.run(
-                [self.ai_provider, prompt],
-                cwd=self.work_dir,
-            )
+            self.ai_client.run_interactive(prompt, cwd=self.work_dir)
         except Exception as e:
             print_color(f"  AI session failed: {e}", "red")
             return False
@@ -4062,7 +4130,8 @@ def detect_workspace_info(workspace_path: Path) -> Optional[dict]:
 
 def resume_from_workspace(
     workspace_path: Path,
-    ai_provider: str = "claude",
+    ai_provider: str = "codex",
+    ai_cli_path: Optional[str] = None,
 ) -> bool:
     """Resume work from an existing workspace.
 
@@ -4137,7 +4206,7 @@ def resume_from_workspace(
         return False
 
     # Create the updater
-    updater = PackageUpdater(instance, target_version, ai_provider)
+    updater = PackageUpdater(instance, target_version, ai_provider, ai_cli_path)
     updater.work_dir = workspace_path
     updater.is_git_workflow = ws_info["is_git"]
 
@@ -4234,7 +4303,8 @@ def main():
         epilog="""
 Examples:
   %(prog)s himmelblau                    # Search for himmelblau package
-  %(prog)s samba --ai-provider gemini    # Use Gemini for version detection
+  %(prog)s samba --ai-provider gemini    # Use Gemini instead of Codex
+  %(prog)s samba --ai-provider claude    # Use Claude instead of Codex
   %(prog)s himmelblau --info-only        # Just show info, don't update
   %(prog)s --resume /tmp/pkg-xxx/pkg     # Resume from existing workspace
   %(prog)s --help                        # Show this help
@@ -4248,9 +4318,9 @@ Examples:
     parser.add_argument(
         "--ai-provider",
         type=str,
-        default="claude",
-        choices=["claude", "gemini"],
-        help="AI CLI to use for version detection (default: claude)",
+        default="codex",
+        choices=list(AI_PROVIDERS),
+        help="AI CLI to use for version detection and assistance (default: codex)",
     )
     parser.add_argument(
         "--ai-cli-path",
@@ -4284,7 +4354,11 @@ Examples:
     # Handle resume mode - detect everything from workspace metadata
     if args.resume:
         workspace_path = Path(args.resume).resolve()
-        success = resume_from_workspace(workspace_path, args.ai_provider)
+        success = resume_from_workspace(
+            workspace_path,
+            args.ai_provider,
+            args.ai_cli_path,
+        )
         sys.exit(0 if success else 1)
 
     # Validate that package is provided for normal mode
@@ -4305,25 +4379,31 @@ Examples:
         sys.exit(1)
 
     pool_sources = PoolSourceClient()
-    version_detector = UpstreamVersionDetector(
-        ai_provider=args.ai_provider,
-        ai_cli_path=args.ai_cli_path,
-    )
+    effective_ai_provider = args.ai_provider
+    effective_ai_cli_path = args.ai_cli_path
 
     # Check AI availability
-    if not args.skip_ai and not shutil.which(args.ai_cli_path or args.ai_provider):
-        fallback = "gemini" if args.ai_provider == "claude" else "claude"
-        if shutil.which(fallback):
+    if not args.skip_ai:
+        ai_client = AIClient(args.ai_provider, args.ai_cli_path)
+        if ai_client.resolve_available():
+            effective_ai_provider = ai_client.provider
+            effective_ai_cli_path = args.ai_cli_path if args.ai_cli_path else None
+        elif args.ai_cli_path:
             print_color(
-                f"Note: {args.ai_provider} not found, using {fallback}", "yellow"
-            )
-            version_detector = UpstreamVersionDetector(
-                ai_provider=fallback, ai_cli_path=fallback
+                f"Note: AI CLI path not available: {args.ai_cli_path}",
+                "yellow",
             )
         else:
             print_color(
-                "Note: No AI CLI available, version detection may be limited", "yellow"
+                "Note: No supported AI CLI available, version detection may be limited",
+                "yellow",
             )
+
+    version_detector = UpstreamVersionDetector(
+        ai_provider=effective_ai_provider,
+        ai_cli_path=effective_ai_cli_path,
+        enable_ai=not args.skip_ai,
+    )
 
     # Gather information
     print_color(f"\nGathering information for: {args.package}", "bold")
@@ -4331,7 +4411,7 @@ Examples:
         args.package,
         searcher,
         pool_sources,
-        version_detector if not args.skip_ai else UpstreamVersionDetector(),
+        version_detector,
     )
 
     # Display information
@@ -4358,7 +4438,12 @@ Examples:
     source_instance = offer_copy_from_existing(info, instance, version, searcher)
 
     # Create updater and run appropriate workflow
-    updater = PackageUpdater(instance, version, args.ai_provider)
+    updater = PackageUpdater(
+        instance,
+        version,
+        effective_ai_provider,
+        effective_ai_cli_path,
+    )
 
     if source_instance:
         # Copy from existing instance first
